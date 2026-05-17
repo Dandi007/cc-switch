@@ -21,6 +21,14 @@ fn update_cached_override(value: Option<PathBuf>) {
     }
 }
 
+/// 设置当前进程内的 app_config_dir 覆盖路径。
+///
+/// 这是 headless/CLI 场景使用的轻量入口，不依赖 Tauri Store，也不会持久化到
+/// `app_paths.json`。GUI 仍然通过 `set_app_config_dir_to_store` 管理持久配置。
+pub fn set_app_config_dir_override_for_process(path: Option<PathBuf>) {
+    update_cached_override(path);
+}
+
 /// 获取缓存中的 app_config_dir 覆盖路径
 pub fn get_app_config_dir_override() -> Option<PathBuf> {
     override_cache().read().ok()?.clone()
