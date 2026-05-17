@@ -469,6 +469,143 @@ fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
 // Codex API 处理器
 // ============================================================================
 
+fn model_family_provider_id(family: &str) -> &str {
+    match family {
+        "openai" => "gpt",
+        other => other,
+    }
+}
+
+async fn route_model_family(
+    state: &ProxyState,
+    body: &mut Value,
+) -> Result<Option<Vec<crate::provider::Provider>>, ProxyError> {
+    let Some(model) = body.get("model").and_then(|m| m.as_str()) else {
+        return Ok(None);
+    };
+    let Some((family, upstream_model)) = model.split_once('/') else {
+        return Ok(None);
+    };
+    if family.is_empty() || upstream_model.is_empty() {
+        return Ok(None);
+    }
+
+    let provider_id = model_family_provider_id(family);
+    let provider = state
+        .db
+        .get_provider_by_id(provider_id, AppType::Codex.as_str())
+        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
+        .ok_or_else(|| ProxyError::ConfigError(format!("未知 model family: {family}")))?;
+
+    body["model"] = Value::String(upstream_model.to_string());
+    Ok(Some(vec![provider]))
+}
+
+fn provider_override_is_codex_oauth(providers: &Option<Vec<crate::provider::Provider>>) -> bool {
+    providers
+        .as_ref()
+        .and_then(|items| items.first())
+        .map(|provider| provider.is_codex_oauth())
+        .unwrap_or(false)
+}
+
+fn normalize_codex_oauth_responses_body(body: &mut Value) {
+    const REASONING_MARKER: &str = "reasoning.encrypted_content";
+    if !body.is_object() {
+        return;
+    }
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("store".to_string(), json!(false));
+        obj.remove("max_output_tokens");
+        obj.remove("temperature");
+        obj.remove("top_p");
+        obj.entry("instructions".to_string()).or_insert(json!(""));
+        obj.entry("tools".to_string()).or_insert(json!([]));
+        obj.entry("parallel_tool_calls".to_string())
+            .or_insert(json!(false));
+        obj.insert("stream".to_string(), json!(true));
+
+        if let Some(input) = obj.get_mut("input") {
+            if let Some(text) = input.as_str() {
+                *input = json!([{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": text,
+                    }],
+                }]);
+            }
+        }
+
+        let include = obj.entry("include".to_string()).or_insert(json!([]));
+        if !include.is_array() {
+            *include = json!([]);
+        }
+        if let Some(items) = include.as_array_mut() {
+            if !items
+                .iter()
+                .any(|value| value.as_str() == Some(REASONING_MARKER))
+            {
+                items.push(json!(REASONING_MARKER));
+            }
+        }
+    }
+}
+
+pub async fn handle_openai_models(
+    State(state): State<ProxyState>,
+) -> Result<Json<Value>, ProxyError> {
+    let providers = state
+        .db
+        .get_all_providers(AppType::Codex.as_str())
+        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+
+    let mut data = Vec::new();
+    for provider in providers.values() {
+        let family = provider
+            .settings_config
+            .get("modelFamily")
+            .and_then(|v| v.as_str())
+            .unwrap_or(provider.id.as_str());
+        let Some(models) = provider
+            .settings_config
+            .get("models")
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+
+        for model in models {
+            let model_id = match model {
+                Value::String(id) => id.as_str(),
+                Value::Object(obj) => obj.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                _ => "",
+            };
+            if model_id.is_empty() {
+                continue;
+            }
+            data.push(json!({
+                "id": format!("{family}/{model_id}"),
+                "object": "model",
+                "created": 0,
+                "owned_by": family,
+            }));
+        }
+    }
+
+    data.sort_by(|a, b| {
+        a.get("id")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("id").and_then(|v| v.as_str()))
+    });
+
+    Ok(Json(json!({
+        "object": "list",
+        "data": data,
+    })))
+}
+
 /// 处理 /v1/chat/completions 请求（OpenAI Chat Completions API - Codex CLI）
 pub async fn handle_chat_completions(
     State(state): State<ProxyState>,
@@ -484,11 +621,20 @@ pub async fn handle_chat_completions(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+    let provider_override = route_model_family(&state, &mut body).await?;
+    let mut ctx = RequestContext::new_with_provider_override(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        provider_override,
+    )
+    .await?;
     let endpoint = endpoint_with_query(&uri, "/chat/completions");
 
     let is_stream = body
@@ -548,11 +694,23 @@ pub async fn handle_responses(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+    let provider_override = route_model_family(&state, &mut body).await?;
+    if provider_override_is_codex_oauth(&provider_override) {
+        normalize_codex_oauth_responses_body(&mut body);
+    }
+    let mut ctx = RequestContext::new_with_provider_override(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        provider_override,
+    )
+    .await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
 
     let is_stream = body
@@ -612,11 +770,20 @@ pub async fn handle_responses_compact(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+    let provider_override = route_model_family(&state, &mut body).await?;
+    let mut ctx = RequestContext::new_with_provider_override(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        provider_override,
+    )
+    .await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
     let is_stream = body

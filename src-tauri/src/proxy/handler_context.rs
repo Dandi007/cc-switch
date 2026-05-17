@@ -88,6 +88,19 @@ impl RequestContext {
         tag: &'static str,
         app_type_str: &'static str,
     ) -> Result<Self, ProxyError> {
+        Self::new_with_provider_override(state, body, headers, app_type, tag, app_type_str, None)
+            .await
+    }
+
+    pub async fn new_with_provider_override(
+        state: &ProxyState,
+        body: &serde_json::Value,
+        headers: &HeaderMap,
+        app_type: AppType,
+        tag: &'static str,
+        app_type_str: &'static str,
+        provider_override: Option<Vec<Provider>>,
+    ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
 
         // 从数据库读取应用级代理配置（per-app）
@@ -126,17 +139,22 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
-            .provider_router
-            .select_providers(app_type_str)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
-                }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+        let providers = match provider_override {
+            Some(providers) => providers,
+            None => state
+                .provider_router
+                .select_providers(app_type_str)
+                .await
+                .map_err(|e| match e {
+                    crate::error::AppError::AllProvidersCircuitOpen => {
+                        ProxyError::AllProvidersCircuitOpen
+                    }
+                    crate::error::AppError::NoProvidersConfigured => {
+                        ProxyError::NoProvidersConfigured
+                    }
+                    _ => ProxyError::DatabaseError(e.to_string()),
+                })?,
+        };
 
         let provider = providers
             .first()
@@ -225,6 +243,7 @@ impl RequestContext {
             state.gemini_shadow.clone(),
             state.failover_manager.clone(),
             state.app_handle.clone(),
+            state.managed_auth.clone(),
             self.current_provider_id.clone(),
             self.session_id.clone(),
             self.session_client_provided,

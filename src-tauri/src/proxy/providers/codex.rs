@@ -34,17 +34,26 @@ impl CodexAdapter {
 
     /// 从 Provider 配置中提取 API Key
     fn extract_key(&self, provider: &Provider) -> Option<String> {
+        if provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.provider_type.as_deref())
+            == Some("codex_oauth")
+        {
+            return Some("codex_oauth_placeholder".to_string());
+        }
+
         // 1. 尝试从 env 中获取
         if let Some(env) = provider.settings_config.get("env") {
             if let Some(key) = env.get("OPENAI_API_KEY").and_then(|v| v.as_str()) {
-                return Some(key.to_string());
+                return Some(resolve_env_reference(key));
             }
         }
 
         // 2. 尝试从 auth 中获取 (Codex CLI 格式)
         if let Some(auth) = provider.settings_config.get("auth") {
             if let Some(key) = auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()) {
-                return Some(key.to_string());
+                return Some(resolve_env_reference(key));
             }
         }
 
@@ -55,7 +64,7 @@ impl CodexAdapter {
             .or_else(|| provider.settings_config.get("api_key"))
             .and_then(|v| v.as_str())
         {
-            return Some(key.to_string());
+            return Some(resolve_env_reference(key));
         }
 
         // 4. 尝试从 config 对象中获取
@@ -65,12 +74,23 @@ impl CodexAdapter {
                 .or_else(|| config.get("apiKey"))
                 .and_then(|v| v.as_str())
             {
-                return Some(key.to_string());
+                return Some(resolve_env_reference(key));
             }
         }
 
         None
     }
+}
+
+fn resolve_env_reference(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(name) = trimmed
+        .strip_prefix("{env:")
+        .and_then(|s| s.strip_suffix('}'))
+    {
+        return std::env::var(name).unwrap_or_else(|_| raw.to_string());
+    }
+    raw.to_string()
 }
 
 impl Default for CodexAdapter {
@@ -85,6 +105,15 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn extract_base_url(&self, provider: &Provider) -> Result<String, ProxyError> {
+        if provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.provider_type.as_deref())
+            == Some("codex_oauth")
+        {
+            return Ok("https://chatgpt.com/backend-api/codex".to_string());
+        }
+
         // 1. 尝试直接获取 base_url 字段
         if let Some(url) = provider
             .settings_config
@@ -132,8 +161,19 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn extract_auth(&self, provider: &Provider) -> Option<AuthInfo> {
-        self.extract_key(provider)
-            .map(|key| AuthInfo::new(key, AuthStrategy::Bearer))
+        self.extract_key(provider).map(|key| {
+            let strategy = if provider
+                .meta
+                .as_ref()
+                .and_then(|m| m.provider_type.as_deref())
+                == Some("codex_oauth")
+            {
+                AuthStrategy::CodexOAuth
+            } else {
+                AuthStrategy::Bearer
+            };
+            AuthInfo::new(key, strategy)
+        })
     }
 
     fn build_url(&self, base_url: &str, endpoint: &str) -> String {

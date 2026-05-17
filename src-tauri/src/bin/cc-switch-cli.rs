@@ -105,14 +105,23 @@ async fn cmd_provider(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Re
     } else {
         args.remove(0)
     };
-    let app_type = require_app(cli)?;
-
     match sub.as_str() {
-        "list" => Ok(serde_json::to_value(ProviderService::list(
-            &app.state, app_type,
-        )?)?),
-        "current" => Ok(json!({ "current": ProviderService::current(&app.state, app_type)? })),
+        "import-opencode" => {
+            let id = required_value(&mut args, "--id")?;
+            Ok(serde_json::to_value(app.import_opencode_provider(&id)?)?)
+        }
+        "list" => {
+            let app_type = require_app(cli)?;
+            Ok(serde_json::to_value(ProviderService::list(
+                &app.state, app_type,
+            )?)?)
+        }
+        "current" => {
+            let app_type = require_app(cli)?;
+            Ok(json!({ "current": ProviderService::current(&app.state, app_type)? }))
+        }
         "add" => {
+            let app_type = require_app(cli)?;
             let file = required_value(&mut args, "--file")?;
             let add_to_live = optional_bool(&mut args, "--add-to-live", false)?;
             let provider: Provider = read_json_file(&file)?;
@@ -121,6 +130,7 @@ async fn cmd_provider(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Re
             )
         }
         "update" => {
+            let app_type = require_app(cli)?;
             let file = required_value(&mut args, "--file")?;
             let id = take_value(&mut args, "--id")?;
             let provider: Provider = read_json_file(&file)?;
@@ -129,28 +139,38 @@ async fn cmd_provider(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Re
             )
         }
         "delete" => {
+            let app_type = require_app(cli)?;
             let id = required_value(&mut args, "--id")?;
             ProviderService::delete(&app.state, app_type, &id)?;
             Ok(ok())
         }
         "switch" => {
+            let app_type = require_app(cli)?;
             let id = required_value(&mut args, "--id")?;
             Ok(serde_json::to_value(ProviderService::switch(
                 &app.state, app_type, &id,
             )?)?)
         }
         "remove-live" => {
+            let app_type = require_app(cli)?;
             let id = required_value(&mut args, "--id")?;
             ProviderService::remove_from_live_config(&app.state, app_type, &id)?;
             Ok(ok())
         }
-        "import-default" => Ok(json!({
-            "imported": ProviderService::import_default_config(&app.state, app_type)?
-        })),
-        "import-live" => Ok(json!({
-            "settings": ProviderService::read_live_settings(app_type)?
-        })),
+        "import-default" => {
+            let app_type = require_app(cli)?;
+            Ok(json!({
+                "imported": ProviderService::import_default_config(&app.state, app_type)?
+            }))
+        }
+        "import-live" => {
+            let app_type = require_app(cli)?;
+            Ok(json!({
+                "settings": ProviderService::read_live_settings(app_type)?
+            }))
+        }
         "sync-live" => {
+            let app_type = require_app(cli)?;
             ProviderService::sync_current_provider_for_app(&app.state, app_type)?;
             Ok(ok())
         }
@@ -286,7 +306,20 @@ async fn cmd_auth(app: &HeadlessApp, mut args: Vec<String>) -> Result<Value> {
     } else {
         args.remove(0)
     };
-    let provider = ManagedAuthProvider::parse(&required_value(&mut args, "--provider")?)?;
+    let provider_raw = required_value(&mut args, "--provider")?;
+
+    if sub == "import-opencode" {
+        if provider_raw.trim().eq_ignore_ascii_case("openai") {
+            return Ok(serde_json::to_value(
+                app.import_opencode_openai_oauth()
+                    .await
+                    .map_err(anyhow::Error::msg)?,
+            )?);
+        }
+        bail!("unsupported OpenCode auth provider: {provider_raw}");
+    }
+
+    let provider = ManagedAuthProvider::parse(&provider_raw)?;
 
     match sub.as_str() {
         "start-login" => Ok(serde_json::to_value(

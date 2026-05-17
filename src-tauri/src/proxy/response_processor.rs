@@ -941,6 +941,7 @@ mod tests {
             provider_router: Arc::new(ProviderRouter::new(db.clone())),
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             app_handle: None,
+            managed_auth: crate::proxy::server::ManagedAuthRegistry::default(),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }
     }

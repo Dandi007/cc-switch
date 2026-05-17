@@ -7,13 +7,16 @@
 use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
+use crate::provider::{AuthBinding, AuthBindingSource, Provider, ProviderMeta};
 use crate::proxy::providers::codex_oauth_auth::{CodexOAuthManager, CodexOAuthStatus};
 use crate::proxy::providers::copilot_auth::{
     CopilotAuthManager, CopilotAuthStatus, GitHubAccount as CopilotAccount,
     GitHubAccount as CodexOAuthAccount, GitHubDeviceCodeResponse,
 };
+use crate::proxy::server::ManagedAuthRegistry;
 use crate::store::AppState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -72,6 +75,96 @@ pub enum ManagedAuthStatus {
 pub enum ManagedAuthAccount {
     Codex(CodexOAuthAccount),
     Copilot(CopilotAccount),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeImportResult {
+    pub provider_id: String,
+    pub family: String,
+    pub app: String,
+    pub models: Vec<String>,
+    pub changed: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeOAuthImportResult {
+    pub account_id: String,
+    pub provider_id: String,
+    pub family: String,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeConfig {
+    #[serde(default)]
+    provider: std::collections::HashMap<String, OpenCodeProviderConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeProviderConfig {
+    #[serde(default)]
+    npm: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    options: OpenCodeProviderOptions,
+    #[serde(default)]
+    models: std::collections::HashMap<String, Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenCodeProviderOptions {
+    #[serde(default)]
+    #[serde(rename = "baseURL", alias = "base_url")]
+    base_url: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "apiKey", alias = "api_key")]
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeAuthFile {
+    #[serde(flatten)]
+    entries: std::collections::HashMap<String, OpenCodeAuthEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenCodeAuthEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    refresh: Option<String>,
+    #[serde(default, rename = "accountId")]
+    account_id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+fn opencode_config_path() -> Result<PathBuf, AppError> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(xdg).join("opencode/opencode.json"));
+    }
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Message("无法定位用户 home 目录".to_string()))?;
+    Ok(home.join(".config/opencode/opencode.json"))
+}
+
+fn opencode_auth_path() -> Result<PathBuf, AppError> {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(xdg).join("opencode/auth.json"));
+    }
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::Message("无法定位用户 home 目录".to_string()))?;
+    Ok(home.join(".local/share/opencode/auth.json"))
+}
+
+fn read_json_path<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T, AppError> {
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| AppError::Message(format!("读取 {} 失败: {e}", path.display())))?;
+    serde_json::from_str(&content)
+        .map_err(|e| AppError::Message(format!("解析 {} 失败: {e}", path.display())))
 }
 
 fn init_global_proxy_client(db: &Database) {
@@ -268,6 +361,12 @@ impl HeadlessApp {
         let app_config_dir = crate::config::get_app_config_dir();
         let codex_oauth = Arc::new(RwLock::new(CodexOAuthManager::new(app_config_dir.clone())));
         let copilot = Arc::new(RwLock::new(CopilotAuthManager::new(app_config_dir)));
+        state
+            .proxy_service
+            .set_managed_auth_registry(ManagedAuthRegistry {
+                codex_oauth: Some(codex_oauth.clone()),
+                copilot: Some(copilot.clone()),
+            });
 
         Ok(Self {
             state,
@@ -439,5 +538,165 @@ impl HeadlessApp {
                 .await
                 .map_err(|e| e.to_string()),
         }
+    }
+
+    pub fn import_opencode_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<OpenCodeImportResult, AppError> {
+        let config: OpenCodeConfig = read_json_path(opencode_config_path()?)?;
+        let source = config
+            .provider
+            .get(provider_id)
+            .ok_or_else(|| AppError::Message(format!("OpenCode provider 不存在: {provider_id}")))?;
+
+        if source.npm.as_deref() != Some("@ai-sdk/openai-compatible") {
+            return Err(AppError::Message(format!(
+                "OpenCode provider {provider_id} 不是 openai-compatible provider"
+            )));
+        }
+
+        let base_url = source.options.base_url.clone().ok_or_else(|| {
+            AppError::Message(format!("OpenCode provider {provider_id} 缺少 baseURL"))
+        })?;
+        let api_key = source.options.api_key.clone().ok_or_else(|| {
+            AppError::Message(format!("OpenCode provider {provider_id} 缺少 apiKey"))
+        })?;
+        let models: Vec<String> = source.models.keys().cloned().collect();
+        if models.is_empty() {
+            return Err(AppError::Message(format!(
+                "OpenCode provider {provider_id} 没有可导入模型"
+            )));
+        }
+
+        let provider = Provider {
+            id: provider_id.to_string(),
+            name: source
+                .name
+                .clone()
+                .unwrap_or_else(|| provider_id.to_string()),
+            settings_config: json!({
+                "base_url": base_url,
+                "apiKey": api_key,
+                "modelFamily": provider_id,
+                "models": models.clone(),
+            }),
+            website_url: None,
+            category: Some("codex".to_string()),
+            created_at: Some(chrono::Utc::now().timestamp_millis()),
+            sort_index: None,
+            notes: Some("Imported from OpenCode provider config".to_string()),
+            meta: Some(ProviderMeta::default()),
+            icon: Some("openai".to_string()),
+            icon_color: Some("#111827".to_string()),
+            in_failover_queue: false,
+        };
+
+        self.state
+            .db
+            .save_provider(AppType::Codex.as_str(), &provider)?;
+        if self
+            .state
+            .db
+            .get_current_provider(AppType::Codex.as_str())?
+            .is_none()
+        {
+            self.state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &provider.id)?;
+        }
+
+        Ok(OpenCodeImportResult {
+            provider_id: provider.id,
+            family: provider_id.to_string(),
+            app: AppType::Codex.as_str().to_string(),
+            models,
+            changed: true,
+        })
+    }
+
+    pub async fn import_opencode_openai_oauth(&self) -> Result<OpenCodeOAuthImportResult, String> {
+        let auth: OpenCodeAuthFile =
+            read_json_path(opencode_auth_path()?).map_err(|e| e.to_string())?;
+        let entry = auth
+            .entries
+            .get("openai")
+            .ok_or_else(|| "OpenCode auth.json 中没有 openai auth".to_string())?;
+        if entry.kind != "oauth" {
+            return Err("OpenCode openai auth 不是 oauth 类型".to_string());
+        }
+        let account_id = entry
+            .account_id
+            .clone()
+            .ok_or_else(|| "OpenCode openai auth 缺少 accountId".to_string())?;
+        let refresh = entry
+            .refresh
+            .clone()
+            .ok_or_else(|| "OpenCode openai auth 缺少 refresh token".to_string())?;
+
+        let account = self
+            .codex_oauth
+            .write()
+            .await
+            .import_refresh_token_account(
+                account_id.clone(),
+                refresh,
+                entry.email.clone(),
+                None,
+                true,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let models = vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()];
+        let provider = Provider {
+            id: "gpt".to_string(),
+            name: "GPT OAuth".to_string(),
+            settings_config: json!({
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "modelFamily": "gpt",
+                "models": models.clone(),
+            }),
+            website_url: None,
+            category: Some("codex".to_string()),
+            created_at: Some(chrono::Utc::now().timestamp_millis()),
+            sort_index: None,
+            notes: Some("Imported from OpenCode openai OAuth auth".to_string()),
+            meta: Some(ProviderMeta {
+                provider_type: Some("codex_oauth".to_string()),
+                auth_binding: Some(AuthBinding {
+                    source: AuthBindingSource::ManagedAccount,
+                    auth_provider: Some("codex_oauth".to_string()),
+                    account_id: Some(account.id.clone()),
+                }),
+                ..ProviderMeta::default()
+            }),
+            icon: Some("openai".to_string()),
+            icon_color: Some("#10A37F".to_string()),
+            in_failover_queue: false,
+        };
+        self.state
+            .db
+            .save_provider(AppType::Codex.as_str(), &provider)
+            .map_err(|e| e.to_string())?;
+        if self
+            .state
+            .db
+            .get_current_provider(AppType::Codex.as_str())
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            self.state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), &provider.id)
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok(OpenCodeOAuthImportResult {
+            account_id: account.id,
+            provider_id: provider.id,
+            family: "gpt".to_string(),
+            models,
+        })
     }
 }

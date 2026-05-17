@@ -639,6 +639,57 @@ impl CodexOAuthManager {
         Ok(())
     }
 
+    /// 导入外部 OpenAI OAuth refresh token。
+    ///
+    /// 只持久化 refresh_token/account_id，不导入 access_token，后续请求仍走本
+    /// manager 的 refresh 流程获取短期 access_token。
+    pub async fn import_refresh_token_account(
+        &self,
+        account_id: String,
+        refresh_token: String,
+        email: Option<String>,
+        authenticated_at: Option<i64>,
+        set_default: bool,
+    ) -> Result<GitHubAccount, CodexOAuthError> {
+        if account_id.trim().is_empty() {
+            return Err(CodexOAuthError::ParseError(
+                "account_id 不能为空".to_string(),
+            ));
+        }
+        if refresh_token.trim().is_empty() {
+            return Err(CodexOAuthError::ParseError(
+                "refresh_token 不能为空".to_string(),
+            ));
+        }
+
+        let account_id = account_id.trim().to_string();
+        let data = CodexAccountData {
+            account_id: account_id.clone(),
+            email,
+            refresh_token,
+            authenticated_at: authenticated_at.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        };
+        let account = GitHubAccount::from(&data);
+
+        {
+            let mut accounts = self.accounts.write().await;
+            accounts.insert(account_id.clone(), data);
+        }
+        {
+            let mut tokens = self.access_tokens.write().await;
+            tokens.remove(&account_id);
+        }
+        {
+            let mut default = self.default_account_id.write().await;
+            if set_default || default.is_none() {
+                *default = Some(account_id);
+            }
+        }
+
+        self.save_to_disk().await?;
+        Ok(account)
+    }
+
     pub async fn clear_auth(&self) -> Result<(), CodexOAuthError> {
         log::info!("[CodexOAuth] 清除所有认证");
 
