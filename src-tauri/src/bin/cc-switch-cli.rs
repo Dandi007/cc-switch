@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use cc_switch_lib::headless::{HeadlessApp, HeadlessOptions, ManagedAuthProvider};
 use cc_switch_lib::{
-    get_settings, update_settings, AppSettings, AppType, LogFilters, McpServer, Prompt,
-    PromptService, Provider, ProviderService, ProxyConfig,
+    get_settings, update_settings, AppSettings, AppType, ClaudeModelRoute, LogFilters, McpServer,
+    Prompt, PromptService, Provider, ProviderService, ProxyConfig,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -109,6 +109,43 @@ async fn cmd_provider(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Re
         "import-opencode" => {
             let id = required_value(&mut args, "--id")?;
             Ok(serde_json::to_value(app.import_opencode_provider(&id)?)?)
+        }
+        "claude-routes" => {
+            let action = if args.is_empty() {
+                bail!("provider claude-routes action is required");
+            } else {
+                args.remove(0)
+            };
+            let id = required_value(&mut args, "--id")?;
+            match action.as_str() {
+                "get" => Ok(serde_json::to_value(app.get_claude_model_routes(&id)?)?),
+                "set" => {
+                    let file = required_value(&mut args, "--file")?;
+                    let replace = optional_bool(&mut args, "--replace", false)?;
+                    let routes: std::collections::HashMap<String, ClaudeModelRoute> =
+                        read_json_file(&file)?;
+                    Ok(serde_json::to_value(
+                        app.set_claude_model_routes(&id, routes, replace)?,
+                    )?)
+                }
+                "import-family" => {
+                    let target_app =
+                        AppType::from_str(&required_value(&mut args, "--target-app")?)?;
+                    let target_provider_id = required_value(&mut args, "--target-provider-id")?;
+                    let family = take_value(&mut args, "--family")?;
+                    let replace = optional_bool(&mut args, "--replace", false)?;
+                    Ok(serde_json::to_value(
+                        app.import_claude_model_family_routes(
+                            &id,
+                            target_app,
+                            &target_provider_id,
+                            family,
+                            replace,
+                        )?,
+                    )?)
+                }
+                other => bail!("unsupported provider claude-routes action: {other}"),
+            }
         }
         "list" => {
             let app_type = require_app(cli)?;

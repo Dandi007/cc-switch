@@ -50,7 +50,7 @@ pub use mcp::{
     sync_single_server_to_codex, sync_single_server_to_gemini,
 };
 pub use prompt::Prompt;
-pub use provider::{Provider, ProviderMeta};
+pub use provider::{ClaudeModelRoute, Provider, ProviderMeta};
 pub use proxy::types::ProxyConfig;
 pub use services::{
     skill::{migrate_skills_to_ssot, ImportSkillSelection},

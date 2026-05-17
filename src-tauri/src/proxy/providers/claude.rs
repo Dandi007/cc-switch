@@ -116,6 +116,17 @@ fn should_preserve_reasoning_content_for_openai_chat(
         .any(is_reasoning_content_compatible_identifier)
 }
 
+fn resolve_env_reference(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(name) = trimmed
+        .strip_prefix("{env:")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        return std::env::var(name).unwrap_or_else(|_| raw.to_string());
+    }
+    raw.to_string()
+}
+
 pub fn transform_claude_request_for_api_format(
     body: serde_json::Value,
     provider: &Provider,
@@ -349,7 +360,7 @@ impl ClaudeAdapter {
                 .filter(|s| !s.is_empty())
             {
                 log::debug!("[Claude] 使用 ANTHROPIC_AUTH_TOKEN");
-                return Some(key.to_string());
+                return Some(resolve_env_reference(key));
             }
             if let Some(key) = env
                 .get("ANTHROPIC_API_KEY")
@@ -358,7 +369,7 @@ impl ClaudeAdapter {
                 .filter(|s| !s.is_empty())
             {
                 log::debug!("[Claude] 使用 ANTHROPIC_API_KEY");
-                return Some(key.to_string());
+                return Some(resolve_env_reference(key));
             }
             // OpenRouter key
             if let Some(key) = env
@@ -368,7 +379,7 @@ impl ClaudeAdapter {
                 .filter(|s| !s.is_empty())
             {
                 log::debug!("[Claude] 使用 OPENROUTER_API_KEY");
-                return Some(key.to_string());
+                return Some(resolve_env_reference(key));
             }
             // 备选 OpenAI key (用于 OpenRouter)
             if let Some(key) = env
@@ -378,7 +389,7 @@ impl ClaudeAdapter {
                 .filter(|s| !s.is_empty())
             {
                 log::debug!("[Claude] 使用 OPENAI_API_KEY");
-                return Some(key.to_string());
+                return Some(resolve_env_reference(key));
             }
             // Gemini Native key
             if let Some(key) = env
@@ -402,7 +413,7 @@ impl ClaudeAdapter {
             .filter(|s| !s.is_empty())
         {
             log::debug!("[Claude] 使用 apiKey/api_key");
-            return Some(key.to_string());
+            return Some(resolve_env_reference(key));
         }
 
         log::warn!("[Claude] 未找到有效的 API Key");

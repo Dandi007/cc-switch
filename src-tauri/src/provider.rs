@@ -238,6 +238,18 @@ pub struct ClaudeDesktopModelRoute {
     pub supports_1m: Option<bool>,
 }
 
+/// Claude Code `/v1/messages` 模型路由。
+///
+/// route key 是 Claude Code 请求体里的 `model`；命中后临时切换到目标
+/// app/provider，并把请求体 model 改写为目标上游模型。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeModelRoute {
+    pub target_app: String,
+    pub target_provider_id: String,
+    pub target_model: String,
+}
+
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
@@ -260,6 +272,13 @@ pub struct ProviderMeta {
         skip_serializing_if = "HashMap::is_empty"
     )]
     pub claude_desktop_model_routes: HashMap<String, ClaudeDesktopModelRoute>,
+    /// Claude Code `/v1/messages` 模型路由映射：Claude-side model alias -> target provider/model。
+    #[serde(
+        default,
+        rename = "claudeModelRoutes",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub claude_model_routes: HashMap<String, ClaudeModelRoute>,
     /// 用量查询脚本配置
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_script: Option<UsageScript>,
