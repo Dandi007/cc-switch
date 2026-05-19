@@ -9,9 +9,8 @@
 #[cfg(test)]
 mod l2_cli_lifecycle {
     use assert_cmd::Command;
-    use std::io::Write;
     use std::net::TcpStream;
-    use std::process::{Child, Stdio};
+    use std::process::{Child, Command as StdCommand, Stdio};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -39,7 +38,7 @@ mod l2_cli_lifecycle {
     }
 
     fn spawn_proxy_foreground(config_dir: &TempDir, addr: &str, port: u16) -> Child {
-        let mut child = Command::new(cli_binary())
+        let mut child = StdCommand::new(cli_binary())
             .arg("--config-dir")
             .arg(config_dir.path())
             .arg("--app")
@@ -219,7 +218,11 @@ mod l2_cli_lifecycle {
         .success();
 
         let pid = proxy.id();
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        let status = StdCommand::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success(), "kill command failed");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut exited = false;

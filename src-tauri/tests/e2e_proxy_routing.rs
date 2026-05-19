@@ -8,8 +8,7 @@
 
 use cc_switch_lib::{
     headless::{HeadlessApp, HeadlessOptions},
-    provider::{Provider, ProviderMeta},
-    AppType,
+    AppType, Provider, ProviderMeta,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
