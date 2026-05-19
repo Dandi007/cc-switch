@@ -34,12 +34,10 @@ use super::{
 };
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
-use crate::provider::{ClaudeModelRoute, Provider};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use std::str::FromStr;
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -128,29 +126,11 @@ async fn handle_messages_for_app(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let mut body: Value = serde_json::from_slice(&body_bytes)
+    let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
-
-    if matches!(app_type, AppType::Claude | AppType::ClaudeDesktop) {
-        if let Some((target_provider, route)) =
-            resolve_claude_model_route(&state, &ctx.provider, &body).await?
-        {
-            body["model"] = Value::String(route.target_model.clone());
-            ctx = RequestContext::new_with_provider_override(
-                &state,
-                &body,
-                &headers,
-                app_type.clone(),
-                tag,
-                app_type_str,
-                Some(vec![target_provider]),
-            )
-            .await?;
-        }
-    }
 
     let raw_endpoint = uri
         .path_and_query()
@@ -225,40 +205,6 @@ async fn handle_messages_for_app(
         connection_guard,
     )
     .await
-}
-
-async fn resolve_claude_model_route(
-    state: &ProxyState,
-    route_owner: &Provider,
-    body: &Value,
-) -> Result<Option<(Provider, ClaudeModelRoute)>, ProxyError> {
-    let Some(model) = body.get("model").and_then(|m| m.as_str()) else {
-        return Ok(None);
-    };
-    let Some(route) = route_owner
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.claude_model_routes.get(model))
-        .cloned()
-    else {
-        return Ok(None);
-    };
-
-    let target_app =
-        AppType::from_str(&route.target_app).map_err(|e| ProxyError::ConfigError(e.to_string()))?;
-    let provider = state
-        .db
-        .get_provider_by_id(&route.target_provider_id, target_app.as_str())
-        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
-        .ok_or_else(|| {
-            ProxyError::ConfigError(format!(
-                "Claude model route target provider not found: app={}, provider={}",
-                target_app.as_str(),
-                route.target_provider_id
-            ))
-        })?;
-
-    Ok(Some((provider, route)))
 }
 
 fn validate_claude_desktop_gateway_auth(

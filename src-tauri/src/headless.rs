@@ -7,7 +7,7 @@
 use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
-use crate::provider::{AuthBinding, AuthBindingSource, ClaudeModelRoute, Provider, ProviderMeta};
+use crate::provider::{AuthBinding, AuthBindingSource, Provider, ProviderMeta};
 use crate::proxy::providers::codex_oauth_auth::{CodexOAuthManager, CodexOAuthStatus};
 use crate::proxy::providers::copilot_auth::{
     CopilotAuthManager, CopilotAuthStatus, GitHubAccount as CopilotAccount,
@@ -17,7 +17,7 @@ use crate::proxy::server::ManagedAuthRegistry;
 use crate::store::AppState;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -95,13 +95,6 @@ pub struct OpenCodeOAuthImportResult {
     pub provider_id: String,
     pub family: String,
     pub models: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClaudeRoutesUpdateResult {
-    pub provider_id: String,
-    pub routes: HashMap<String, ClaudeModelRoute>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -617,6 +610,9 @@ impl HeadlessApp {
         self.state
             .db
             .save_provider(AppType::Codex.as_str(), &provider)?;
+        self.state
+            .db
+            .save_provider(AppType::Claude.as_str(), &provider)?;
         if self
             .state
             .db
@@ -720,6 +716,10 @@ impl HeadlessApp {
             .db
             .save_provider(AppType::Codex.as_str(), &provider)
             .map_err(|e| e.to_string())?;
+        self.state
+            .db
+            .save_provider(AppType::Claude.as_str(), &provider)
+            .map_err(|e| e.to_string())?;
         if self
             .state
             .db
@@ -739,114 +739,5 @@ impl HeadlessApp {
             family: "gpt".to_string(),
             models,
         })
-    }
-
-    pub fn get_claude_model_routes(
-        &self,
-        provider_id: &str,
-    ) -> Result<ClaudeRoutesUpdateResult, AppError> {
-        let provider = self
-            .state
-            .db
-            .get_provider_by_id(provider_id, AppType::Claude.as_str())?
-            .ok_or_else(|| AppError::Message(format!("Claude provider 不存在: {provider_id}")))?;
-        let routes = provider
-            .meta
-            .as_ref()
-            .map(|meta| meta.claude_model_routes.clone())
-            .unwrap_or_default();
-        Ok(ClaudeRoutesUpdateResult {
-            provider_id: provider_id.to_string(),
-            routes,
-        })
-    }
-
-    pub fn set_claude_model_routes(
-        &self,
-        provider_id: &str,
-        routes: HashMap<String, ClaudeModelRoute>,
-        replace: bool,
-    ) -> Result<ClaudeRoutesUpdateResult, AppError> {
-        let mut provider = self
-            .state
-            .db
-            .get_provider_by_id(provider_id, AppType::Claude.as_str())?
-            .ok_or_else(|| AppError::Message(format!("Claude provider 不存在: {provider_id}")))?;
-        let meta = provider.meta.get_or_insert_with(ProviderMeta::default);
-        if replace {
-            meta.claude_model_routes = routes;
-        } else {
-            meta.claude_model_routes.extend(routes);
-        }
-        let result = meta.claude_model_routes.clone();
-        self.state
-            .db
-            .save_provider(AppType::Claude.as_str(), &provider)?;
-        Ok(ClaudeRoutesUpdateResult {
-            provider_id: provider_id.to_string(),
-            routes: result,
-        })
-    }
-
-    pub fn import_claude_model_family_routes(
-        &self,
-        provider_id: &str,
-        target_app: AppType,
-        target_provider_id: &str,
-        family: Option<String>,
-        replace: bool,
-    ) -> Result<ClaudeRoutesUpdateResult, AppError> {
-        let target = self
-            .state
-            .db
-            .get_provider_by_id(target_provider_id, target_app.as_str())?
-            .ok_or_else(|| {
-                AppError::Message(format!(
-                    "target provider 不存在: app={}, provider={target_provider_id}",
-                    target_app.as_str()
-                ))
-            })?;
-        let family = family
-            .or_else(|| {
-                target
-                    .settings_config
-                    .get("modelFamily")
-                    .and_then(|value| value.as_str())
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_else(|| target_provider_id.to_string());
-        let models = target
-            .settings_config
-            .get("models")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| {
-                AppError::Message(format!(
-                    "target provider {target_provider_id} 缺少 settingsConfig.models"
-                ))
-            })?;
-
-        let mut routes = HashMap::new();
-        for model in models {
-            let model_id = match model {
-                Value::String(id) => id.as_str(),
-                Value::Object(obj) => obj.get("id").and_then(|value| value.as_str()).unwrap_or(""),
-                _ => "",
-            };
-            if model_id.is_empty() {
-                continue;
-            }
-            for alias in [model_id.to_string(), format!("{family}/{model_id}")] {
-                routes.insert(
-                    alias,
-                    ClaudeModelRoute {
-                        target_app: target_app.as_str().to_string(),
-                        target_provider_id: target_provider_id.to_string(),
-                        target_model: model_id.to_string(),
-                    },
-                );
-            }
-        }
-
-        self.set_claude_model_routes(provider_id, routes, replace)
     }
 }
