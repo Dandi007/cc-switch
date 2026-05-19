@@ -170,7 +170,7 @@ impl CachedAccessToken {
 }
 
 /// 进行中的 Device Code 条目，带过期时间以便清理放弃的登录流程
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingDeviceCode {
     user_code: String,
     /// Unix 毫秒时间戳，超时后可清理
@@ -217,6 +217,8 @@ struct CodexOAuthStore {
     accounts: HashMap<String, CodexAccountData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pending_device_codes: HashMap<String, PendingDeviceCode>,
 }
 
 /// Codex OAuth 认证管理器（多账号）
@@ -306,6 +308,7 @@ impl CodexOAuthManager {
                 },
             );
         }
+        self.save_to_disk().await?;
 
         log::info!(
             "[CodexOAuth] 获取 Device Code 成功，user_code: {}",
@@ -342,6 +345,8 @@ impl CodexOAuthManager {
         if entry.expires_at_ms <= chrono::Utc::now().timestamp_millis() {
             let mut pending = self.pending_device_codes.write().await;
             pending.remove(device_code);
+            drop(pending);
+            self.save_to_disk().await?;
             return Err(CodexOAuthError::ExpiredToken);
         }
 
@@ -913,6 +918,18 @@ impl CodexOAuthManager {
                 }
             }
         }
+        if let Ok(mut pending) = self.pending_device_codes.try_write() {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            *pending = store
+                .pending_device_codes
+                .into_iter()
+                .filter(|(_, entry)| entry.expires_at_ms > now_ms)
+                .collect();
+            log::info!(
+                "[CodexOAuth] 从磁盘加载 {} 个进行中的 Device Code",
+                pending.len()
+            );
+        }
 
         Ok(())
     }
@@ -920,11 +937,21 @@ impl CodexOAuthManager {
     async fn save_to_disk(&self) -> Result<(), CodexOAuthError> {
         let accounts = self.accounts.read().await.clone();
         let default = self.resolve_default_account_id().await;
+        let pending_device_codes = {
+            let pending = self.pending_device_codes.read().await;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            pending
+                .iter()
+                .filter(|(_, entry)| entry.expires_at_ms > now_ms)
+                .map(|(device_code, entry)| (device_code.clone(), entry.clone()))
+                .collect()
+        };
 
         let store = CodexOAuthStore {
             version: 1,
             accounts,
             default_account_id: default,
+            pending_device_codes,
         };
 
         let content = serde_json::to_string_pretty(&store)
