@@ -977,6 +977,33 @@ fn should_use_claude_transform_streaming(
 ///
 /// 复用 `proxy::sse` 的 `take_sse_block`/`strip_sse_field`：`take_sse_block` 同时支持
 /// `\n\n` 与 `\r\n\r\n` 两种分隔符，`strip_sse_field` 兼容带/不带空格的字段写法。
+/// 识别上游"context window 超限"类错误。
+///
+/// Why: Claude Code 客户端按 `claude-opus-4-7` 的窗口（~1M）预估上下文，
+/// 但路由到 `gpt/gpt-5.5` 的 ChatGPT Codex backend 实际窗口远小于此。
+/// 命中后改返回 400 invalid_request_error，让客户端识别为请求级问题
+/// 而非"代理转换错误"（422），便于触发 /compact 或人工裁剪后重试。
+fn is_context_window_exceeded_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "exceeds the context window",
+        "exceeds the model's context",
+        "exceed the context window",
+        "exceed the model's context",
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context length",
+        "context window of this model",
+        "input is too long",
+        "request too large",
+        "prompt is too long",
+        "tokens exceeds",
+        "上下文窗口",
+        "上下文长度",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     let mut buffer = body.to_string();
     let mut completed_response: Option<Value> = None;
@@ -1021,6 +1048,9 @@ fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
                     .pointer("/response/error/message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("response.failed event received");
+                if is_context_window_exceeded_message(message) {
+                    return Err(ProxyError::InvalidRequest(message.to_string()));
+                }
                 return Err(ProxyError::TransformError(message.to_string()));
             }
             _ => {}
@@ -1132,7 +1162,10 @@ async fn log_usage(
 
 #[cfg(test)]
 mod tests {
-    use super::{responses_sse_to_response_value, should_use_claude_transform_streaming};
+    use super::{
+        is_context_window_exceeded_message, responses_sse_to_response_value,
+        should_use_claude_transform_streaming,
+    };
     use crate::proxy::ProxyError;
 
     #[test]
@@ -1209,6 +1242,55 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
         match err {
             ProxyError::TransformError(msg) => assert!(msg.contains("upstream blew up")),
             other => panic!("expected TransformError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_window_marker_detection_positive_cases() {
+        let cases = [
+            "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            "This model's maximum context length is 400000 tokens.",
+            "context_length_exceeded: please reduce the input.",
+            "Request too large for model gpt-5.5",
+            "The prompt is too long for this model",
+            "请求 token 数已超过模型上下文窗口限制",
+        ];
+        for msg in cases {
+            assert!(
+                is_context_window_exceeded_message(msg),
+                "should match context-window marker: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_window_marker_detection_negative_cases() {
+        let cases = [
+            "upstream blew up",
+            "Internal server error",
+            "Refresh Token 失效或已过期",
+            "rate limit reached",
+            "model not found",
+        ];
+        for msg in cases {
+            assert!(
+                !is_context_window_exceeded_message(msg),
+                "should not match context-window marker: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_sse_response_failed_with_context_window_maps_to_invalid_request() {
+        let sse = "event: response.failed\n\
+data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"Your input exceeds the context window of this model. Please adjust your input and try again.\"}}}\n\n";
+
+        let err = responses_sse_to_response_value(sse).unwrap_err();
+        match err {
+            ProxyError::InvalidRequest(msg) => {
+                assert!(msg.contains("context window"), "unexpected message: {msg}")
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
         }
     }
 
