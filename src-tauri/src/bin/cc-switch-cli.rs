@@ -4,10 +4,11 @@ use cc_switch_lib::{
     get_settings, update_settings, AppSettings, AppType, ClaudeModelRoute, LogFilters, McpServer,
     Prompt, PromptService, Provider, ProviderService, ProxyConfig,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 #[derive(Debug)]
 struct Cli {
@@ -97,6 +98,125 @@ fn print_json<T: Serialize>(value: &T, pretty: bool) -> Result<()> {
 
 fn ok() -> Value {
     json!({ "ok": true })
+}
+
+// ============================================================================
+// Cross-process proxy state (PID file)
+// ============================================================================
+//
+// Each `cc-switch-cli proxy start` invocation lives in its own process with its
+// own ProxyService state. Without IPC, sibling `proxy status` / `proxy stop`
+// invocations see an empty in-process state and report "not running" (and stop
+// becomes a no-op). The running instance writes a JSON record at
+// `<config-dir>/proxy.pid` on start and removes it on clean stop so siblings
+// can detect and signal it.
+
+#[derive(Serialize, Deserialize)]
+struct ProxyPidRecord {
+    pid: u32,
+    address: String,
+    port: u16,
+    started_at: String,
+}
+
+fn pid_file_path(cli: &Cli) -> PathBuf {
+    let base = cli.config_dir.clone().unwrap_or_else(|| {
+        dirs::home_dir()
+            .expect("无法定位用户 home 目录")
+            .join(".cc-switch")
+    });
+    base.join("proxy.pid")
+}
+
+fn write_pid_file(cli: &Cli, address: &str, port: u16, started_at: &str) -> Result<()> {
+    let path = pid_file_path(cli);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let rec = ProxyPidRecord {
+        pid: std::process::id(),
+        address: address.to_string(),
+        port,
+        started_at: started_at.to_string(),
+    };
+    let bytes = serde_json::to_vec(&rec)?;
+    std::fs::write(&path, bytes).with_context(|| format!("写入 PID 文件失败: {}", path.display()))
+}
+
+fn read_pid_file(cli: &Cli) -> Option<ProxyPidRecord> {
+    let bytes = std::fs::read(pid_file_path(cli)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn remove_pid_file(cli: &Cli) {
+    let _ = std::fs::remove_file(pid_file_path(cli));
+}
+
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    // Non-Unix: conservatively return false so the caller falls back to the
+    // legacy in-process behavior. PID-file cross-process control is a Unix-only
+    // feature in this CLI.
+    false
+}
+
+#[cfg(unix)]
+fn send_sigterm(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn send_sigterm(_pid: u32) -> bool {
+    false
+}
+
+fn port_is_listening(address: &str, port: u16) -> bool {
+    let host = if address.is_empty() || address == "0.0.0.0" {
+        "127.0.0.1"
+    } else {
+        address
+    };
+    let target = format!("{host}:{port}");
+    target
+        .parse()
+        .ok()
+        .and_then(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()
+        })
+        .is_some()
+}
+
+/// Returns `Some(rec)` iff PID file exists, the recorded PID is alive, and the
+/// recorded port accepts a TCP connection. Stale records (dead PID) are removed
+/// as a side effect.
+fn external_running(cli: &Cli) -> Option<ProxyPidRecord> {
+    let rec = read_pid_file(cli)?;
+    if !pid_is_alive(rec.pid) {
+        remove_pid_file(cli);
+        return None;
+    }
+    if !port_is_listening(&rec.address, rec.port) {
+        return None;
+    }
+    Some(rec)
 }
 
 async fn cmd_provider(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Result<Value> {
@@ -211,6 +331,50 @@ async fn cmd_provider(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Re
             ProviderService::sync_current_provider_for_app(&app.state, app_type)?;
             Ok(ok())
         }
+        "failover" => {
+            // Manage the per-app failover queue (providers.in_failover_queue).
+            // When auto_failover_enabled is on, only providers in this queue are
+            // eligible — without a CLI for this, users had to write raw SQL.
+            let action = if args.is_empty() {
+                bail!("provider failover action is required (list | add | remove | clear)");
+            } else {
+                args.remove(0)
+            };
+            let app_type = require_app(cli)?;
+            let app_str = app_type.as_str();
+            match action.as_str() {
+                "list" => Ok(serde_json::to_value(
+                    app.state
+                        .db
+                        .get_failover_queue(app_str)
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                )?),
+                "add" => {
+                    let id = required_value(&mut args, "--id")?;
+                    app.state
+                        .db
+                        .add_to_failover_queue(app_str, &id)
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    Ok(ok())
+                }
+                "remove" => {
+                    let id = required_value(&mut args, "--id")?;
+                    app.state
+                        .db
+                        .remove_from_failover_queue(app_str, &id)
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    Ok(ok())
+                }
+                "clear" => {
+                    app.state
+                        .db
+                        .clear_failover_queue(app_str)
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    Ok(ok())
+                }
+                other => bail!("unsupported provider failover action: {other}"),
+            }
+        }
         other => bail!("unsupported provider subcommand: {other}"),
     }
 }
@@ -230,37 +394,79 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
                 .start()
                 .await
                 .map_err(anyhow::Error::msg)?;
+            if let Err(e) = write_pid_file(cli, &info.address, info.port, &info.started_at) {
+                log::warn!("PID 文件写入失败（不影响 proxy 运行）: {e:#}");
+            }
             tokio::signal::ctrl_c().await?;
-            app.state
-                .proxy_service
-                .stop_with_restore()
-                .await
-                .map_err(anyhow::Error::msg)?;
+            let stop_result = app.state.proxy_service.stop_with_restore().await;
+            remove_pid_file(cli);
+            stop_result.map_err(anyhow::Error::msg)?;
             Ok(serde_json::to_value(info)?)
         }
-        "stop" => {
-            app.state
-                .proxy_service
-                .stop()
-                .await
-                .map_err(anyhow::Error::msg)?;
-            Ok(ok())
-        }
-        "stop-restore" => {
-            app.state
-                .proxy_service
-                .stop_with_restore()
-                .await
-                .map_err(anyhow::Error::msg)?;
-            Ok(ok())
-        }
-        "status" | "health" => Ok(serde_json::to_value(
-            app.state
+        "stop" => match app.state.proxy_service.stop().await {
+            Ok(()) => {
+                remove_pid_file(cli);
+                Ok(ok())
+            }
+            Err(e) => {
+                // In-process state empty: try cross-process via PID file.
+                if let Some(rec) = external_running(cli) {
+                    if send_sigterm(rec.pid) {
+                        remove_pid_file(cli);
+                        return Ok(json!({
+                            "ok": true,
+                            "source": "pid_file",
+                            "pid": rec.pid,
+                        }));
+                    }
+                }
+                Err(anyhow::Error::msg(e))
+            }
+        },
+        "stop-restore" => match app.state.proxy_service.stop_with_restore().await {
+            Ok(()) => {
+                remove_pid_file(cli);
+                Ok(ok())
+            }
+            Err(e) => {
+                if let Some(rec) = external_running(cli) {
+                    if send_sigterm(rec.pid) {
+                        remove_pid_file(cli);
+                        return Ok(json!({
+                            "ok": true,
+                            "source": "pid_file",
+                            "pid": rec.pid,
+                            "note": "external instance signalled; Live config restore was skipped (not owned by this process)",
+                        }));
+                    }
+                }
+                Err(anyhow::Error::msg(e))
+            }
+        },
+        "status" | "health" => {
+            let status = app
+                .state
                 .proxy_service
                 .get_status()
                 .await
-                .map_err(anyhow::Error::msg)?,
-        )?),
+                .map_err(anyhow::Error::msg)?;
+            if status.running {
+                return Ok(serde_json::to_value(status)?);
+            }
+            // Fall back to PID file if a sibling process owns the running proxy.
+            if let Some(rec) = external_running(cli) {
+                return Ok(json!({
+                    "running": true,
+                    "address": rec.address,
+                    "port": rec.port,
+                    "started_at": rec.started_at,
+                    "pid": rec.pid,
+                    "source": "pid_file",
+                    "note": "owned by another process; runtime metrics unavailable from this invocation",
+                }));
+            }
+            Ok(serde_json::to_value(status)?)
+        }
         "config" => {
             let action = if args.is_empty() {
                 bail!("proxy config action is required");
@@ -333,6 +539,64 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
         "circuit-breaker" => Ok(json!({
             "unsupported": "CLI circuit-breaker mutation is not exposed yet; use proxy status for runtime health."
         })),
+        "app" => {
+            // Per-app proxy_config mutations: set enabled / auto_failover_enabled
+            // without forcing users to drop down to raw SQL.
+            let action = if args.is_empty() {
+                bail!("proxy app action is required (get | set-enabled | set-failover)");
+            } else {
+                args.remove(0)
+            };
+            let app_type = require_app(cli)?;
+            let app_str = app_type.as_str();
+            match action.as_str() {
+                "get" => Ok(serde_json::to_value(
+                    app.state
+                        .db
+                        .get_proxy_config_for_app(app_str)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                )?),
+                "set-enabled" => {
+                    let value = optional_bool(&mut args, "--value", true)?;
+                    let mut config = app
+                        .state
+                        .db
+                        .get_proxy_config_for_app(app_str)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    config.enabled = value;
+                    app.state
+                        .db
+                        .update_proxy_config_for_app(config)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    Ok(ok())
+                }
+                "set-failover" => {
+                    let value = optional_bool(&mut args, "--value", true)?;
+                    let mut config = app
+                        .state
+                        .db
+                        .get_proxy_config_for_app(app_str)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    if value && !config.enabled {
+                        bail!(
+                            "must enable the app first: proxy app set-enabled --app {app_str} --value true"
+                        );
+                    }
+                    config.auto_failover_enabled = value;
+                    app.state
+                        .db
+                        .update_proxy_config_for_app(config)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    Ok(ok())
+                }
+                other => bail!("unsupported proxy app action: {other}"),
+            }
+        }
         other => bail!("unsupported proxy subcommand: {other}"),
     }
 }
