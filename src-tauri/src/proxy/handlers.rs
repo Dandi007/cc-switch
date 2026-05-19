@@ -510,16 +510,16 @@ async fn route_provider_model_for_app(
     }
 
     let provider_id = model_family_provider_id(family);
-    let provider = state
+    let Some(provider) = state
         .db
         .get_provider_by_id(provider_id, app_type.as_str())
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
-        .ok_or_else(|| {
-            ProxyError::ConfigError(format!(
-                "未知 model provider: app={}, provider={family}",
-                app_type.as_str()
-            ))
-        })?;
+    else {
+        log::debug!(
+            "[route] unknown model prefix family={family}, falling through to default provider"
+        );
+        return Ok(None);
+    };
 
     body["model"] = Value::String(upstream_model.to_string());
     Ok(Some(vec![provider]))
@@ -548,7 +548,18 @@ fn normalize_codex_oauth_responses_body(body: &mut Value) {
         obj.entry("tools".to_string()).or_insert(json!([]));
         obj.entry("parallel_tool_calls".to_string())
             .or_insert(json!(false));
-        obj.insert("stream".to_string(), json!(true));
+
+        // Only force stream:true when the caller didn't explicitly request
+        // stream:false. Upstream codex_oauth always upgrades to SSE, but
+        // non-streaming clients must still receive aggregated JSON per the
+        // OpenAI Responses contract.
+        let explicit_false = obj
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .map_or(false, |b| !b); // true when stream == false
+        if !explicit_false {
+            obj.insert("stream".to_string(), json!(true));
+        }
 
         if let Some(input) = obj.get_mut("input") {
             if let Some(text) = input.as_str() {
