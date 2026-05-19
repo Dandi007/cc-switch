@@ -126,11 +126,20 @@ async fn handle_messages_for_app(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
+    let provider_override = route_provider_model_for_app(&state, &app_type, &mut body).await?;
+    let mut ctx = RequestContext::new_with_provider_override(
+        &state,
+        &body,
+        &headers,
+        app_type.clone(),
+        tag,
+        app_type_str,
+        provider_override,
+    )
+    .await?;
 
     let raw_endpoint = uri
         .path_and_query()
@@ -476,8 +485,9 @@ fn model_family_provider_id(family: &str) -> &str {
     }
 }
 
-async fn route_model_family(
+async fn route_provider_model_for_app(
     state: &ProxyState,
+    app_type: &AppType,
     body: &mut Value,
 ) -> Result<Option<Vec<crate::provider::Provider>>, ProxyError> {
     let Some(model) = body.get("model").and_then(|m| m.as_str()) else {
@@ -493,9 +503,14 @@ async fn route_model_family(
     let provider_id = model_family_provider_id(family);
     let provider = state
         .db
-        .get_provider_by_id(provider_id, AppType::Codex.as_str())
+        .get_provider_by_id(provider_id, app_type.as_str())
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
-        .ok_or_else(|| ProxyError::ConfigError(format!("未知 model family: {family}")))?;
+        .ok_or_else(|| {
+            ProxyError::ConfigError(format!(
+                "未知 model provider: app={}, provider={family}",
+                app_type.as_str()
+            ))
+        })?;
 
     body["model"] = Value::String(upstream_model.to_string());
     Ok(Some(vec![provider]))
@@ -624,7 +639,8 @@ pub async fn handle_chat_completions(
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let provider_override = route_model_family(&state, &mut body).await?;
+    let provider_override =
+        route_provider_model_for_app(&state, &AppType::Codex, &mut body).await?;
     let mut ctx = RequestContext::new_with_provider_override(
         &state,
         &body,
@@ -697,7 +713,8 @@ pub async fn handle_responses(
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let provider_override = route_model_family(&state, &mut body).await?;
+    let provider_override =
+        route_provider_model_for_app(&state, &AppType::Codex, &mut body).await?;
     if provider_override_is_codex_oauth(&provider_override) {
         normalize_codex_oauth_responses_body(&mut body);
     }
@@ -773,7 +790,8 @@ pub async fn handle_responses_compact(
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let provider_override = route_model_family(&state, &mut body).await?;
+    let provider_override =
+        route_provider_model_for_app(&state, &AppType::Codex, &mut body).await?;
     let mut ctx = RequestContext::new_with_provider_override(
         &state,
         &body,
