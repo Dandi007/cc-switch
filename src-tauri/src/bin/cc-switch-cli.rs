@@ -360,7 +360,25 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
             if let Err(e) = write_pid_file(cli, &info.address, info.port, &info.started_at) {
                 log::warn!("PID 文件写入失败（不影响 proxy 运行）: {e:#}");
             }
-            tokio::signal::ctrl_c().await?;
+            // Wait for either Ctrl+C or SIGTERM. On SIGTERM the process exits
+            // the select! and runs the cleanup path (stop_with_restore +
+            // remove_pid_file) before returning.
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        use tokio::signal::unix::{signal, SignalKind};
+                        let mut term = signal(SignalKind::terminate())
+                            .expect("install SIGTERM handler");
+                        term.recv().await;
+                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    log::info!("收到 SIGTERM，正在优雅关闭...");
+                }
+            }
             let stop_result = app.state.proxy_service.stop_with_restore().await;
             remove_pid_file(cli);
             stop_result.map_err(anyhow::Error::msg)?;
@@ -392,16 +410,16 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
                 Ok(ok())
             }
             Err(e) => {
-                if let Some(rec) = external_running(cli) {
-                    if send_sigterm(rec.pid) {
-                        remove_pid_file(cli);
-                        return Ok(json!({
-                            "ok": true,
-                            "source": "pid_file",
-                            "pid": rec.pid,
-                            "note": "external instance signalled; Live config restore was skipped (not owned by this process)",
-                        }));
-                    }
+                // If an external instance owns the running proxy, do NOT send
+                // SIGTERM — that would cause the external instance to restore
+                // live config (which it legitimately modified), potentially
+                // wiping the user's proxy settings.
+                if external_running(cli).is_some() {
+                    bail!(
+                        "proxy is running in another process (pid file detected). \
+                         stop-restore is only allowed from the process that owns the proxy. \
+                         Use 'proxy stop' to send a clean shutdown signal instead."
+                    );
                 }
                 Err(anyhow::Error::msg(e))
             }
@@ -476,6 +494,20 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
                     if matches!(app_type, AppType::OpenCode) {
                         bail!(
                             "unsupported: opencode proxy takeover is intentionally not implemented"
+                        );
+                    }
+                    // Require a running proxy before modifying takeover state.
+                    // A short-lived CLI that sets takeover and exits leaves
+                    // dead-pointer live configs.
+                    let running_in_process = app
+                        .state
+                        .proxy_service
+                        .is_running()
+                        .await;
+                    if !running_in_process && external_running(cli).is_none() {
+                        bail!(
+                            "proxy is not running. Start the proxy first with 'proxy start' \
+                             before enabling takeover."
                         );
                     }
                     let enabled = optional_bool(&mut args, "--enabled", true)?;
@@ -846,9 +878,17 @@ async fn run() -> Result<()> {
         bail!("command is required");
     }
 
+    // Only recover proxy crash state when the explicit intent is to start the
+    // proxy. Read-only sibling commands (status, provider list, config, etc.)
+    // must not trigger recover_from_crash, which would tear down an already
+    // running proxy.
+    let first_arg = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+    let is_proxy_start = first_arg == "proxy"
+        && cli.args.get(1).map(|s| s.as_str()) == Some("start");
+
     let app = HeadlessApp::init(HeadlessOptions {
         config_dir: cli.config_dir.clone(),
-        recover_proxy: true,
+        recover_proxy: is_proxy_start,
     })
     .await?;
 
