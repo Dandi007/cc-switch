@@ -129,7 +129,9 @@ async fn handle_messages_for_app(
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let provider_override = route_provider_model_for_app(&state, &app_type, &mut body).await?;
+    let registry_app_type = model_provider_registry_app_type(&app_type);
+    let provider_override =
+        route_provider_model_for_app(&state, &registry_app_type, &mut body).await?;
     let mut ctx = RequestContext::new_with_provider_override(
         &state,
         &body,
@@ -482,6 +484,13 @@ fn model_family_provider_id(family: &str) -> &str {
     match family {
         "openai" => "gpt",
         other => other,
+    }
+}
+
+fn model_provider_registry_app_type(app_type: &AppType) -> AppType {
+    match app_type {
+        AppType::Claude => AppType::Codex,
+        _ => app_type.clone(),
     }
 }
 
