@@ -111,3 +111,4 @@ serial_test = "3"
 tempfile = "3"
 wiremock = "0.6"
 assert_cmd = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }

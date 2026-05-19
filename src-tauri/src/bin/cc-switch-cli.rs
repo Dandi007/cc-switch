@@ -504,10 +504,19 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
                         .proxy_service
                         .is_running()
                         .await;
-                    if !running_in_process && external_running(cli).is_none() {
+                    let external = external_running(cli);
+
+                    if !running_in_process && external.is_none() {
                         bail!(
                             "proxy is not running. Start the proxy first with 'proxy start' \
                              before enabling takeover."
+                        );
+                    }
+                    if !running_in_process && external.is_some() {
+                        bail!(
+                            "proxy is running in another process (pid file detected). \
+                             Takeover state can only be modified from the owning process. \
+                             Stop it with 'proxy stop' first, or run takeover from the foreground CLI."
                         );
                     }
                     let enabled = optional_bool(&mut args, "--enabled", true)?;
@@ -885,6 +894,19 @@ async fn run() -> Result<()> {
     let first_arg = cli.args.first().map(|s| s.as_str()).unwrap_or("");
     let is_proxy_start = first_arg == "proxy"
         && cli.args.get(1).map(|s| s.as_str()) == Some("start");
+
+    // HeadlessApp::init(recover_proxy=true) runs recover_from_crash, which
+    // mutates live config & deletes backup files. If another proxy process
+    // already owns the PID file, we must refuse before init to avoid tearing
+    // down the active proxy's takeover state.
+    if is_proxy_start {
+        if let Some(rec) = external_running(&cli) {
+            bail!(
+                "another proxy is already running (pid={}, port={}).                  Stop it with 'proxy stop' first, or check with 'proxy status'.",
+                rec.pid, rec.port
+            );
+        }
+    }
 
     let app = HeadlessApp::init(HeadlessOptions {
         config_dir: cli.config_dir.clone(),

@@ -533,7 +533,7 @@ fn provider_override_is_codex_oauth(providers: &Option<Vec<crate::provider::Prov
         .unwrap_or(false)
 }
 
-fn normalize_codex_oauth_responses_body(body: &mut Value) {
+pub(crate) fn normalize_codex_oauth_responses_body(body: &mut Value) {
     const REASONING_MARKER: &str = "reasoning.encrypted_content";
     if !body.is_object() {
         return;
@@ -549,17 +549,11 @@ fn normalize_codex_oauth_responses_body(body: &mut Value) {
         obj.entry("parallel_tool_calls".to_string())
             .or_insert(json!(false));
 
-        // Only force stream:true when the caller didn't explicitly request
-        // stream:false. Upstream codex_oauth always upgrades to SSE, but
-        // non-streaming clients must still receive aggregated JSON per the
-        // OpenAI Responses contract.
-        let explicit_false = obj
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .map_or(false, |b| !b); // true when stream == false
-        if !explicit_false {
-            obj.insert("stream".to_string(), json!(true));
-        }
+        // Upstream codex_oauth always responds with SSE regardless of what
+        // the client requested. The is_stream flag (captured before this
+        // normalize) controls whether process_response aggregates SSE into
+        // JSON for non-streaming clients.
+        obj.insert("stream".to_string(), json!(true));
 
         if let Some(input) = obj.get_mut("input") {
             if let Some(text) = input.as_str() {
@@ -733,11 +727,15 @@ pub async fn handle_responses(
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
+    // Capture client stream intent BEFORE normalize mutates the body.
+    let client_wants_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false); // OpenAI Responses default is non-streaming
+
     let provider_override =
         route_provider_model_for_app(&state, &AppType::Codex, &mut body).await?;
-    if provider_override_is_codex_oauth(&provider_override) {
-        normalize_codex_oauth_responses_body(&mut body);
-    }
+
     let mut ctx = RequestContext::new_with_provider_override(
         &state,
         &body,
@@ -748,12 +746,19 @@ pub async fn handle_responses(
         provider_override,
     )
     .await?;
+
+    // Use the resolved provider (not just provider_override) to decide
+    // whether to normalize. This covers the case where the current/default
+    // provider is codex_oauth but the model has no prefix slug → route
+    // returns None, yet the downstream backend is still the ChatGPT OAuth
+    // endpoint and needs the normalized request shape.
+    if ctx.provider.is_codex_oauth() {
+        normalize_codex_oauth_responses_body(&mut body);
+    }
+
     let endpoint = endpoint_with_query(&uri, "/responses");
 
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_stream = client_wants_stream;
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -1284,5 +1289,70 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"Your 
 data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n";
 
         assert!(responses_sse_to_response_value(sse).is_err());
+    }
+
+    // ===================================================================
+    // normalize_codex_oauth_responses_body unit tests
+    // ===================================================================
+
+    #[test]
+    fn normalize_stream_false_stays_true() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": false,
+        });
+        super::normalize_codex_oauth_responses_body(&mut body);
+        // Upstream always SSE; body must carry stream:true for ChatGPT backend.
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["store"], serde_json::json!(false));
+        assert!(body["include"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("reasoning.encrypted_content")));
+    }
+
+    #[test]
+    fn normalize_stream_omit_defaults_true() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+        });
+        super::normalize_codex_oauth_responses_body(&mut body);
+        assert_eq!(body["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn normalize_stream_true_preserves() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true,
+        });
+        super::normalize_codex_oauth_responses_body(&mut body);
+        assert_eq!(body["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn normalize_wraps_string_input() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "plain text input",
+        });
+        super::normalize_codex_oauth_responses_body(&mut body);
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "plain text input"}],
+            }])
+        );
+    }
+
+    #[test]
+    fn normalize_skips_non_object() {
+        let mut body = serde_json::json!("not an object");
+        super::normalize_codex_oauth_responses_body(&mut body);
+        assert_eq!(body, serde_json::json!("not an object"));
     }
 }

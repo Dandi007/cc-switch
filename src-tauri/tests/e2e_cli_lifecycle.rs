@@ -38,6 +38,8 @@ mod l2_cli_lifecycle {
     }
 
     fn spawn_proxy_foreground(config_dir: &TempDir, addr: &str, port: u16) -> Child {
+        seed_proxy_config(config_dir, addr, port);
+
         let mut child = StdCommand::new(cli_binary())
             .arg("--config-dir")
             .arg(config_dir.path())
@@ -56,6 +58,26 @@ mod l2_cli_lifecycle {
             "proxy did not start listening on {addr}:{port} within 15s"
         );
         child
+    }
+
+    fn seed_proxy_config(config_dir: &TempDir, addr: &str, port: u16) {
+        let _ = StdCommand::new(cli_binary())
+            .arg("--config-dir")
+            .arg(config_dir.path())
+            .arg("--app")
+            .arg("codex")
+            .arg("provider")
+            .arg("list")
+            .output()
+            .expect("init db");
+
+        let db_path = config_dir.path().join("cc-switch.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        conn.execute(
+            "UPDATE proxy_config SET listen_address = ?1, listen_port = ?2",
+            rusqlite::params![addr, port as i32],
+        )
+        .expect("update proxy port");
     }
 
     fn sibling_cmd(config_dir: &TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
@@ -246,5 +268,78 @@ mod l2_cli_lifecycle {
         );
 
         let _ = proxy.kill();
+    }
+    // -----------------------------------------------------------------------
+    // ⭐ L2.takeover_set_rejected_from_sibling — A2 fix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn l2_takeover_set_rejected_from_sibling() {
+        let dir = TempDir::new().expect("tempdir");
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().unwrap().port()
+        };
+
+        let mut proxy = spawn_proxy_foreground(&dir, "127.0.0.1", port);
+
+        // Sibling CLI must not be allowed to modify takeover state even
+        // though the proxy is running (the sibling doesn't own the process).
+        let result = sibling_cmd(
+            &dir,
+            &[
+                "--app", "claude", "proxy", "takeover", "set", "--enabled", "true",
+            ],
+        );
+
+        let stderr = String::from_utf8_lossy(&result.get_output().stderr);
+        assert!(
+            !result.get_output().status.success() || stderr.contains("another process"),
+            "sibling takeover set must be rejected, stderr={stderr}"
+        );
+
+        assert!(
+            wait_for_port("127.0.0.1", port, Duration::from_secs(2)),
+            "foreground proxy must still be running after rejected sibling takeover set"
+        );
+
+        let _ = proxy.kill();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // -----------------------------------------------------------------------
+    // ⭐ L2.duplicate_start_rejected — A3 fix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn l2_duplicate_start_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().unwrap().port()
+        };
+
+        let mut proxy = spawn_proxy_foreground(&dir, "127.0.0.1", port);
+
+        // A second proxy start must be refused before init runs
+        // recover_from_crash, which would tear down the active proxy.
+        let result = sibling_cmd(
+            &dir,
+            &["--app", "codex", "proxy", "start"],
+        );
+
+        let stderr = String::from_utf8_lossy(&result.get_output().stderr);
+        assert!(
+            !result.get_output().status.success() || stderr.contains("already running"),
+            "duplicate proxy start must be rejected, stderr={stderr}"
+        );
+
+        assert!(
+            wait_for_port("127.0.0.1", port, Duration::from_secs(2)),
+            "foreground proxy must still be running after rejected duplicate start"
+        );
+
+        let _ = proxy.kill();
+        std::thread::sleep(Duration::from_millis(300));
     }
 }

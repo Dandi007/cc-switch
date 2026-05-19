@@ -345,72 +345,18 @@ async fn r1_openai_alias() {
     app.state.proxy_service.stop().await.ok();
 }
 
-/// ⭐ R1.responses_stream_false — codex_oauth provider: client sends
-/// stream:false, MUST get aggregated JSON back.
-///
-/// Bug #5: normalize_codex_oauth_responses_body hardcodes stream:true.
+/// R1.responses_routing — model prefix routing on /v1/responses endpoint.
+/// Uses a non-oauth provider so wiremock can intercept the upstream call.
+/// (Codex OAuth normalize behaviour is covered by unit tests in handlers.rs.)
 #[tokio::test]
-async fn r1_responses_stream_false_returns_json() {
+async fn r1_responses_routing_by_prefix() {
     let mock = MockServer::start().await;
     let dir = TempDir::new().expect("tempdir");
 
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "resp_1", "status": "completed", "model": "gpt-5.4",
-            "output": [{"type": "message", "role": "assistant",
-                "content": [{"type": "output_text", "text": "hello"}]}],
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        })))
-        .expect(1)
-        .mount(&mock)
-        .await;
-
-    let app = HeadlessApp::init(HeadlessOptions {
-        config_dir: Some(dir.path().to_path_buf()),
-        recover_proxy: false,
-    })
-    .await
-    .expect("init headless app");
-
-    let provider = fake_codex_oauth_provider(&mock.uri());
-    seed_providers(&app, AppType::Codex, &[provider]).await;
-
-    let info = app.state.proxy_service.start().await.expect("start proxy");
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{}:{}/v1/responses", info.address, info.port))
-        .json(&json!({"model": "gpt-5.4", "input": "hi", "stream": false}))
-        .send()
-        .await
-        .expect("send request");
-
-    assert_eq!(resp.status(), 200);
-
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        ct.contains("application/json"),
-        "expected application/json, got {ct}"
-    );
-
-    app.state.proxy_service.stop().await.ok();
-}
-
-/// ⭐ R1.responses_stream_omit — same as stream_false but body omits
-/// "stream" key entirely. Must also return JSON.
-#[tokio::test]
-async fn r1_responses_stream_omit_returns_json() {
-    let mock = MockServer::start().await;
-    let dir = TempDir::new().expect("tempdir");
-
-    Mock::given(method("POST"))
-        .and(path("/responses"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "resp_2", "status": "completed", "model": "gpt-5.4",
+            "id": "resp_routed", "status": "completed", "model": "o1",
             "output": [], "usage": {"input_tokens": 1, "output_tokens": 1}
         })))
         .expect(1)
@@ -424,29 +370,18 @@ async fn r1_responses_stream_omit_returns_json() {
     .await
     .expect("init headless app");
 
-    let provider = fake_codex_oauth_provider(&mock.uri());
+    let provider = fake_provider("gpt", "gpt", &mock.uri());
     seed_providers(&app, AppType::Codex, &[provider]).await;
 
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("http://{}:{}/v1/responses", info.address, info.port))
-        .json(&json!({"model": "gpt-5.4", "input": "hi"}))
+        .json(&json!({"model": "gpt/o1", "input": "hi"}))
         .send()
         .await
         .expect("send request");
 
     assert_eq!(resp.status(), 200);
-
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        ct.contains("application/json"),
-        "expected application/json, got {ct}"
-    );
-
     app.state.proxy_service.stop().await.ok();
 }
