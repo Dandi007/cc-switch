@@ -525,13 +525,6 @@ async fn route_provider_model_for_app(
     Ok(Some(vec![provider]))
 }
 
-fn provider_override_is_codex_oauth(providers: &Option<Vec<crate::provider::Provider>>) -> bool {
-    providers
-        .as_ref()
-        .and_then(|items| items.first())
-        .map(|provider| provider.is_codex_oauth())
-        .unwrap_or(false)
-}
 
 pub(crate) fn normalize_codex_oauth_responses_body(body: &mut Value) {
     const REASONING_MARKER: &str = "reasoning.encrypted_content";

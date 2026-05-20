@@ -78,6 +78,24 @@ async fn seed_providers(app: &HeadlessApp, app_type: AppType, providers: &[Provi
     }
 }
 
+fn seed_listen_port(config_dir: &TempDir, port: u16) {
+    let db_path = config_dir.path().join("cc-switch.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open db");
+    conn.execute(
+        "UPDATE proxy_config SET listen_address = '127.0.0.1', listen_port = ?1",
+        rusqlite::params![port as i32],
+    )
+    .expect("update proxy port");
+}
+
+fn allocate_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 // ---------------------------------------------------------------------------
 // R1 – model routing
 // ---------------------------------------------------------------------------
@@ -109,6 +127,8 @@ async fn r1_no_slash_passthrough() {
     let provider = fake_provider("lingzhi", "lingzhi", &mock.uri());
     seed_providers(&app, AppType::Codex, &[provider]).await;
 
+    let port = allocate_port();
+    seed_listen_port(&dir, port);
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
@@ -152,6 +172,8 @@ async fn r1_local_prefix_gpt() {
     let provider = fake_provider("gpt", "gpt", &mock.uri());
     seed_providers(&app, AppType::Codex, &[provider]).await;
 
+    let port = allocate_port();
+    seed_listen_port(&dir, port);
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
@@ -195,6 +217,8 @@ async fn r1_local_prefix_lingzhi() {
     let provider = fake_provider("lingzhi", "lingzhi", &mock.uri());
     seed_providers(&app, AppType::Codex, &[provider]).await;
 
+    let port = allocate_port();
+    seed_listen_port(&dir, port);
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
@@ -241,6 +265,8 @@ async fn r1_unknown_prefix_fallthrough() {
     let provider = fake_provider("lingzhi", "lingzhi", &mock.uri());
     seed_providers(&app, AppType::Codex, &[provider]).await;
 
+    let port = allocate_port();
+    seed_listen_port(&dir, port);
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
@@ -286,6 +312,8 @@ async fn r1_multi_slash_unknown_prefix_fallthrough() {
     let provider = fake_provider("lingzhi", "lingzhi", &mock.uri());
     seed_providers(&app, AppType::Codex, &[provider]).await;
 
+    let port = allocate_port();
+    seed_listen_port(&dir, port);
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
@@ -329,6 +357,8 @@ async fn r1_openai_alias() {
     let provider = fake_provider("gpt", "gpt", &mock.uri());
     seed_providers(&app, AppType::Codex, &[provider]).await;
 
+    let port = allocate_port();
+    seed_listen_port(&dir, port);
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
@@ -373,6 +403,8 @@ async fn r1_responses_routing_by_prefix() {
     let provider = fake_provider("gpt", "gpt", &mock.uri());
     seed_providers(&app, AppType::Codex, &[provider]).await;
 
+    let port = allocate_port();
+    seed_listen_port(&dir, port);
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
