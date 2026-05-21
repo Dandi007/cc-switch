@@ -6,6 +6,14 @@ use axum::{
 use serde_json::json;
 use thiserror::Error;
 
+pub fn is_transient_overload_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("server_is_overloaded")
+        || lower.contains("service_unavailable_error")
+        || lower.contains("overloaded_error")
+        || lower.contains("currently overloaded")
+}
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("服务器已在运行")]
@@ -143,8 +151,12 @@ impl IntoResponse for ProxyError {
                         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
                     }
                     ProxyError::ConfigError(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-                    ProxyError::TransformError(_) => {
-                        (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
+                    ProxyError::TransformError(message) => {
+                        if is_transient_overload_message(message) {
+                            (StatusCode::from_u16(529).unwrap(), self.to_string())
+                        } else {
+                            (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
+                        }
                     }
                     ProxyError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
                     ProxyError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
@@ -158,10 +170,16 @@ impl IntoResponse for ProxyError {
                     ProxyError::UpstreamError { .. } => unreachable!(),
                 };
 
+                let error_type = match &self {
+                    ProxyError::TransformError(message) if is_transient_overload_message(message) => {
+                        "overloaded_error"
+                    }
+                    _ => "proxy_error",
+                };
                 let error_body = json!({
                     "error": {
                         "message": message,
-                        "type": "proxy_error",
+                        "type": error_type,
                     }
                 });
 

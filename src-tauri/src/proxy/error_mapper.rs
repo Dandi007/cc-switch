@@ -2,7 +2,7 @@
 //!
 //! 将 ProxyError 映射到合适的 HTTP 状态码，用于日志记录
 
-use super::ProxyError;
+use super::{error::is_transient_overload_message, ProxyError};
 
 /// 将 ProxyError 映射到 HTTP 状态码
 ///
@@ -43,6 +43,7 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         ProxyError::DatabaseError(_) => 500,
 
         // 转换错误：500 Internal Server Error
+        ProxyError::TransformError(message) if is_transient_overload_message(message) => 529,
         ProxyError::TransformError(_) => 500,
 
         // 无效请求：400 Bad Request（与 IntoResponse 保持一致）
