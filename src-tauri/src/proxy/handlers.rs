@@ -386,7 +386,10 @@ async fn handle_claude_transform(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     let upstream_response: Value = if aggregate_codex_oauth_responses_sse {
-        responses_sse_to_response_value(&body_str)?
+        responses_sse_to_response_value(&body_str).map_err(|e| {
+            log_forward_error(&state, &ctx, is_stream, &e);
+            e
+        })?
     } else {
         serde_json::from_slice(&body_bytes).map_err(|e| {
             log::error!("[Claude] 解析上游响应失败: {e}, body: {body_str}");

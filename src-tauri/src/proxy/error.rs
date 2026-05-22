@@ -14,6 +14,15 @@ pub fn is_transient_overload_message(message: &str) -> bool {
         || lower.contains("currently overloaded")
 }
 
+/// OpenAI Responses API 在 response.failed 里发回的通用可重试错误。
+/// 该错误的 HTTP 外壳是 200，cc-switch 将 body 中的 response.failed 转换为
+/// TransformError，需要告知 Claude Code 可以重试（返回 529）。
+pub fn is_openai_retryable_error_message(message: &str) -> bool {
+    message.contains("An error occurred while processing your request")
+        || message.contains("You can retry your request")
+        || message.contains("help.openai.com")
+}
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("服务器已在运行")]
@@ -152,7 +161,9 @@ impl IntoResponse for ProxyError {
                     }
                     ProxyError::ConfigError(_) => (StatusCode::BAD_REQUEST, self.to_string()),
                     ProxyError::TransformError(message) => {
-                        if is_transient_overload_message(message) {
+                        if is_transient_overload_message(message)
+                            || is_openai_retryable_error_message(message)
+                        {
                             (StatusCode::from_u16(529).unwrap(), self.to_string())
                         } else {
                             (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
@@ -171,7 +182,10 @@ impl IntoResponse for ProxyError {
                 };
 
                 let error_type = match &self {
-                    ProxyError::TransformError(message) if is_transient_overload_message(message) => {
+                    ProxyError::TransformError(message)
+                        if is_transient_overload_message(message)
+                            || is_openai_retryable_error_message(message) =>
+                    {
                         "overloaded_error"
                     }
                     _ => "proxy_error",
