@@ -216,6 +216,32 @@ impl Database {
         .map_err(|e| AppError::Database(e.to_string()))?;
         Self::create_request_logs_usage_indexes_if_supported(conn)?;
 
+        // 10b. Proxy Request Payloads 表（全量记录请求/响应 body）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proxy_request_payloads (
+                request_id TEXT PRIMARY KEY,
+                request_body TEXT NOT NULL,
+                response_body TEXT,
+                request_headers TEXT,
+                response_headers TEXT,
+                extracted_user_message TEXT,
+                extracted_assistant_message TEXT,
+                extracted_tools TEXT,
+                extracted_thinking TEXT,
+                payload_size_bytes INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (request_id) REFERENCES proxy_request_logs(request_id)
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 proxy_request_payloads 表失败: {e}")))?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_payloads_created ON proxy_request_payloads(created_at)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 idx_payloads_created 索引失败: {e}")))?;
+
         // 11. Model Pricing 表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS model_pricing (
@@ -430,6 +456,11 @@ impl Database {
                         log::info!("迁移数据库从 v9 到 v10（添加 Hermes Agent 支持）");
                         Self::migrate_v9_to_v10(conn)?;
                         Self::set_user_version(conn, 10)?;
+                    }
+                    10 => {
+                        log::info!("迁移数据库从 v10 到 v11（添加 payload recording 支持）");
+                        Self::migrate_v10_to_v11(conn)?;
+                        Self::set_user_version(conn, 11)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1197,6 +1228,23 @@ impl Database {
         }
 
         log::info!("v9 -> v10 迁移完成：已添加 Hermes Agent 支持");
+        Ok(())
+    }
+
+    /// v10 -> v11 迁移：添加 payload recording 支持（FTS5 全文索引）
+    fn migrate_v10_to_v11(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS proxy_payload_fts USING fts5(
+                extracted_user_message,
+                extracted_assistant_message,
+                extracted_thinking,
+                content=proxy_request_payloads,
+                content_rowid=rowid
+            );",
+        )
+        .map_err(|e| AppError::Database(format!("v11 migration 失败（FTS5）: {e}")))?;
+
+        log::info!("v10 -> v11 迁移完成：已添加 payload recording FTS5 索引");
         Ok(())
     }
 
