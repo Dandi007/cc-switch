@@ -1016,7 +1016,10 @@ async fn run() -> Result<()> {
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    let is_proxy_start = std::env::args().collect::<Vec<_>>().windows(2)
+        .any(|w| w[0] == "proxy" && w[1] == "start");
+    let default_level = if is_proxy_start { "info" } else { "warn" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .format_timestamp_secs()
         .init();
 
