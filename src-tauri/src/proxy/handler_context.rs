@@ -65,6 +65,8 @@ pub struct RequestContext {
     pub optimizer_config: OptimizerConfig,
     /// Copilot 优化器配置
     pub copilot_optimizer_config: CopilotOptimizerConfig,
+    /// 已过滤的请求体（从 ForwardResult 传递，用于 payload recording）
+    pub captured_request_body: Option<serde_json::Value>,
 }
 
 impl RequestContext {
@@ -185,6 +187,7 @@ impl RequestContext {
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
+            captured_request_body: None,
         })
     }
 

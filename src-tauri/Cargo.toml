@@ -83,6 +83,7 @@ uuid = { version = "1.11", features = ["v4"] }
 sha2 = "0.10"
 json5 = "0.4"
 json-five = "0.3.1"
+env_logger = "0.11"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
@@ -109,3 +110,6 @@ strip = "symbols"
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
+wiremock = "0.6"
+assert_cmd = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }

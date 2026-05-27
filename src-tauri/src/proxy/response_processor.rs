@@ -217,6 +217,9 @@ pub async fn handle_streaming(
     // 创建使用量收集器；关闭 usage logging 时不要在流式热路径上解析每个 SSE event。
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), parser_config);
 
+    // 创建 payload 收集器（收集所有 SSE events 用于聚合）
+    let payload_collector = create_payload_collector(ctx, state);
+
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
 
@@ -227,6 +230,7 @@ pub async fn handle_streaming(
         usage_collector,
         timeout_config,
         connection_guard,
+        payload_collector,
     );
 
     let body = axum::body::Body::from_stream(logged_stream);
@@ -279,6 +283,7 @@ pub async fn handle_non_streaming(
                     ctx.request_model.clone()
                 };
 
+                let request_id = usage.dedup_request_id();
                 spawn_log_usage(
                     state,
                     ctx,
@@ -287,6 +292,16 @@ pub async fn handle_non_streaming(
                     &ctx.request_model,
                     status.as_u16(),
                     false,
+                    Some(request_id.clone()),
+                );
+                spawn_log_payload(
+                    state,
+                    ctx,
+                    ctx.captured_request_body.clone(),
+                    Some(json_value.clone()),
+                    None,
+                    None,
+                    &request_id,
                 );
             } else {
                 let model = json_value
@@ -294,6 +309,7 @@ pub async fn handle_non_streaming(
                     .and_then(|m| m.as_str())
                     .unwrap_or(&ctx.request_model)
                     .to_string();
+                let fallback_request_id = TokenUsage::default().dedup_request_id();
                 spawn_log_usage(
                     state,
                     ctx,
@@ -302,6 +318,16 @@ pub async fn handle_non_streaming(
                     &ctx.request_model,
                     status.as_u16(),
                     false,
+                    Some(fallback_request_id.clone()),
+                );
+                spawn_log_payload(
+                    state,
+                    ctx,
+                    ctx.captured_request_body.clone(),
+                    Some(json_value.clone()),
+                    None,
+                    None,
+                    &fallback_request_id,
                 );
                 log::debug!(
                     "[{}] 未能解析 usage 信息，跳过记录",
@@ -322,6 +348,7 @@ pub async fn handle_non_streaming(
                 &ctx.request_model,
                 status.as_u16(),
                 false,
+                None,
             );
         }
     } else {
@@ -533,6 +560,7 @@ fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        None,
                     )
                     .await;
                 });
@@ -557,6 +585,7 @@ fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        None,
                     )
                     .await;
                 });
@@ -564,6 +593,110 @@ fn create_usage_collector(
             }
         },
     ))
+}
+
+/// 异步记录 payload（请求/响应 body 全量记录）
+fn spawn_log_payload(
+    state: &ProxyState,
+    _ctx: &RequestContext,
+    request_body: Option<Value>,
+    response_body: Option<Value>,
+    request_headers: Option<Value>,
+    response_headers: Option<Value>,
+    request_id: &str,
+) {
+    let Some(request_body) = request_body else {
+        return;
+    };
+
+    let db = state.db.clone();
+    let request_id = request_id.to_string();
+    let created_at = chrono::Utc::now().timestamp();
+
+    tokio::spawn(async move {
+        use super::usage::payload_logger::{PayloadLog, PayloadLogger};
+
+        let logger = PayloadLogger::new(&db);
+        let log = PayloadLog {
+            request_id,
+            request_body,
+            response_body,
+            request_headers,
+            response_headers,
+            created_at,
+        };
+        if let Err(e) = logger.log_payload(log) {
+            log::warn!("payload 记录失败: {e}");
+        }
+    });
+}
+
+/// 创建 payload 收集器（流式请求用）
+///
+/// 收集所有 SSE events，在流结束时聚合为完整 assistant message JSON，
+/// 然后调用 `spawn_log_payload` 写入数据库。
+pub(crate) fn create_payload_collector(
+    ctx: &RequestContext,
+    state: &ProxyState,
+) -> Option<SseUsageCollector> {
+    let captured_request_body = ctx.captured_request_body.clone();
+    let captured_request_body = match captured_request_body {
+        Some(body) => body,
+        None => return None,
+    };
+
+    let state = state.clone();
+    let ctx_snapshot = RequestContextSnapshot {
+        tag: ctx.tag,
+        app_type_str: ctx.app_type_str.to_string(),
+        request_model: ctx.request_model.clone(),
+        session_id: ctx.session_id.clone(),
+    };
+
+    Some(SseUsageCollector::new(
+        ctx.start_time,
+        None, // 收集所有 events，不设 filter
+        move |events, _first_token_ms| {
+            let aggregated = aggregate_sse_events(&events);
+            let captured_body = captured_request_body.clone();
+            let state = state.clone();
+            let ctx = ctx_snapshot.clone();
+
+            tokio::spawn(async move {
+                // 从 SSE events 中提取 upstream message_id，和 usage logger 的
+                // dedup_request_id 保持一致（格式 "session:{message_id}"）
+                let message_id = events.iter().find_map(|e| {
+                    e.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())
+                });
+                let request_id = message_id
+                    .map(|mid| format!("session:{mid}"))
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                use super::usage::payload_logger::{PayloadLog, PayloadLogger};
+                let logger = PayloadLogger::new(&state.db);
+                let log = PayloadLog {
+                    request_id,
+                    request_body: captured_body,
+                    response_body: Some(aggregated),
+                    request_headers: None,
+                    response_headers: None,
+                    created_at: chrono::Utc::now().timestamp(),
+                };
+                if let Err(e) = logger.log_payload(log) {
+                    log::warn!("payload 记录失败（流式）: {e}");
+                }
+            });
+        },
+    ))
+}
+
+/// RequestContext 快照（用于跨 await 传递）
+#[derive(Clone)]
+struct RequestContextSnapshot {
+    tag: &'static str,
+    app_type_str: String,
+    request_model: String,
+    session_id: String,
 }
 
 /// 异步记录使用量
@@ -575,6 +708,7 @@ fn spawn_log_usage(
     request_model: &str,
     status_code: u16,
     is_streaming: bool,
+    override_request_id: Option<String>,
 ) {
     // Check enable_logging before spawning the log task
     if let Ok(config) = state.config.try_read() {
@@ -591,6 +725,7 @@ fn spawn_log_usage(
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
 
+    let override_id = override_request_id;
     tokio::spawn(async move {
         log_usage_internal(
             &state,
@@ -604,6 +739,7 @@ fn spawn_log_usage(
             is_streaming,
             status_code,
             Some(session_id),
+            override_id,
         )
         .await;
     });
@@ -631,6 +767,7 @@ async fn log_usage_internal(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    override_request_id: Option<String>,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -643,7 +780,7 @@ async fn log_usage_internal(
         model
     };
 
-    let request_id = usage.dedup_request_id();
+    let request_id = override_request_id.unwrap_or_else(|| usage.dedup_request_id());
 
     log::debug!(
         "[{app_type}] 记录请求日志: id={request_id}, provider={provider_id}, model={model}, streaming={is_streaming}, status={status_code}, latency_ms={latency_ms}, first_token_ms={first_token_ms:?}, session={}, input={}, output={}, cache_read={}, cache_creation={}",
@@ -681,6 +818,7 @@ pub fn create_logged_passthrough_stream(
     usage_collector: Option<SseUsageCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
+    payload_collector: Option<SseUsageCollector>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
@@ -688,8 +826,10 @@ pub fn create_logged_passthrough_stream(
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
+        let mut payload_collector = payload_collector;
+        let mut payload_finish_guard = payload_collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events =
-            collector.is_some() || log::log_enabled!(log::Level::Debug);
+            collector.is_some() || payload_collector.is_some() || log::log_enabled!(log::Level::Debug);
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -750,20 +890,25 @@ pub fn create_logged_passthrough_stream(
                                 for line in event_text.lines() {
                                     if let Some(data) = strip_sse_field(line, "data") {
                                         if data.trim() != "[DONE]" {
-                                            let collected = match &collector {
-                                                Some(c) if c.should_collect(data) => {
-                                                    match serde_json::from_str::<Value>(data) {
-                                                        Ok(json_value) => {
-                                                            c.push(json_value).await;
-                                                            true
-                                                        }
-                                                        Err(_) => false,
+                                            // 解析 JSON 事件（usage 和 payload 共享解析结果）
+                                            if let Ok(json_value) = serde_json::from_str::<Value>(data) {
+                                                // Usage collector: 仅推送匹配 filter 的事件
+                                                let collected = match &collector {
+                                                    Some(c) if c.should_collect(data) => {
+                                                        c.push(json_value.clone()).await;
+                                                        true
                                                     }
+                                                    _ => false,
+                                                };
+                                                // Payload collector: 推送所有 JSON 事件
+                                                if let Some(ref pc) = payload_collector {
+                                                    pc.push(json_value).await;
                                                 }
-                                                _ => false,
-                                            };
-                                            if collected {
-                                                log::debug!("[{tag}] <<< SSE 事件: {data}");
+                                                if collected {
+                                                    log::debug!("[{tag}] <<< SSE 事件: {data}");
+                                                } else {
+                                                    log::debug!("[{tag}] <<< SSE 数据: {data}");
+                                                }
                                             } else {
                                                 log::debug!("[{tag}] <<< SSE 数据: {data}");
                                             }
@@ -793,10 +938,85 @@ pub fn create_logged_passthrough_stream(
         if let Some(c) = collector.take() {
             c.finish().await;
         }
+        if let Some(pc) = payload_collector.take() {
+            pc.finish().await;
+        }
         if let Some(guard) = &mut finish_guard {
             guard.disarm();
         }
+        if let Some(guard) = &mut payload_finish_guard {
+            guard.disarm();
+        }
     }
+}
+
+/// 从 SSE events 聚合完整的 assistant message JSON
+///
+/// 支持 OpenAI streaming (choices[].delta) 和 Anthropic streaming (delta) 两种格式。
+pub(crate) fn aggregate_sse_events(events: &[Value]) -> Value {
+    let mut text_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    let mut model = None;
+    let mut usage = None;
+
+    for event in events {
+        if model.is_none() {
+            model = event.get("model").cloned();
+        }
+        if let Some(u) = event.get("usage") {
+            usage = Some(u.clone());
+        }
+        // OpenAI streaming: choices[].delta
+        if let Some(choices) = event.get("choices").and_then(|c| c.as_array()) {
+            for choice in choices {
+                let delta = choice.get("delta").unwrap_or(choice);
+                if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                    text_parts.push(content.to_string());
+                }
+                if let Some(reasoning) =
+                    delta.get("reasoning_content").and_then(|c| c.as_str())
+                {
+                    reasoning_parts.push(reasoning.to_string());
+                }
+                if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                    tool_calls.extend(calls.iter().cloned());
+                }
+            }
+        }
+        // Anthropic streaming: content_block_delta
+        if let Some(delta) = event.get("delta") {
+            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                text_parts.push(text.to_string());
+            }
+            if let Some(thinking) = delta.get("thinking").and_then(|t| t.as_str()) {
+                reasoning_parts.push(thinking.to_string());
+            }
+        }
+    }
+
+    let mut result = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": text_parts.join(""),
+            }
+        }]
+    });
+    if !reasoning_parts.is_empty() {
+        result["choices"][0]["message"]["reasoning_content"] =
+            Value::String(reasoning_parts.join(""));
+    }
+    if !tool_calls.is_empty() {
+        result["choices"][0]["message"]["tool_calls"] = Value::Array(tool_calls);
+    }
+    if let Some(m) = model {
+        result["model"] = m;
+    }
+    if let Some(u) = usage {
+        result["usage"] = u;
+    }
+    result
 }
 
 fn format_headers(headers: &HeaderMap) -> String {
@@ -1019,6 +1239,7 @@ mod tests {
             false,
             200,
             None,
+            None,
         )
         .await;
 
@@ -1078,6 +1299,7 @@ mod tests {
             None,
             false,
             200,
+            None,
             None,
         )
         .await;

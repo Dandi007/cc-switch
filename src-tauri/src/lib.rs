@@ -53,6 +53,7 @@ pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
 pub use proxy::types::ProxyConfig;
 pub use services::{
+    payload::PayloadService,
     skill::{migrate_skills_to_ssot, ImportSkillSelection},
     ConfigService, EndpointLatency, LogFilters, McpService, PromptService, ProviderService,
     ProxyService, SkillService, SpeedtestService,

@@ -360,7 +360,25 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
             if let Err(e) = write_pid_file(cli, &info.address, info.port, &info.started_at) {
                 log::warn!("PID 文件写入失败（不影响 proxy 运行）: {e:#}");
             }
-            tokio::signal::ctrl_c().await?;
+            // Wait for either Ctrl+C or SIGTERM. On SIGTERM the process exits
+            // the select! and runs the cleanup path (stop_with_restore +
+            // remove_pid_file) before returning.
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        use tokio::signal::unix::{signal, SignalKind};
+                        let mut term = signal(SignalKind::terminate())
+                            .expect("install SIGTERM handler");
+                        term.recv().await;
+                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    log::info!("收到 SIGTERM，正在优雅关闭...");
+                }
+            }
             let stop_result = app.state.proxy_service.stop_with_restore().await;
             remove_pid_file(cli);
             stop_result.map_err(anyhow::Error::msg)?;
@@ -392,16 +410,16 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
                 Ok(ok())
             }
             Err(e) => {
-                if let Some(rec) = external_running(cli) {
-                    if send_sigterm(rec.pid) {
-                        remove_pid_file(cli);
-                        return Ok(json!({
-                            "ok": true,
-                            "source": "pid_file",
-                            "pid": rec.pid,
-                            "note": "external instance signalled; Live config restore was skipped (not owned by this process)",
-                        }));
-                    }
+                // If an external instance owns the running proxy, do NOT send
+                // SIGTERM — that would cause the external instance to restore
+                // live config (which it legitimately modified), potentially
+                // wiping the user's proxy settings.
+                if external_running(cli).is_some() {
+                    bail!(
+                        "proxy is running in another process (pid file detected). \
+                         stop-restore is only allowed from the process that owns the proxy. \
+                         Use 'proxy stop' to send a clean shutdown signal instead."
+                    );
                 }
                 Err(anyhow::Error::msg(e))
             }
@@ -476,6 +494,29 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
                     if matches!(app_type, AppType::OpenCode) {
                         bail!(
                             "unsupported: opencode proxy takeover is intentionally not implemented"
+                        );
+                    }
+                    // Require a running proxy before modifying takeover state.
+                    // A short-lived CLI that sets takeover and exits leaves
+                    // dead-pointer live configs.
+                    let running_in_process = app
+                        .state
+                        .proxy_service
+                        .is_running()
+                        .await;
+                    let external = external_running(cli);
+
+                    if !running_in_process && external.is_none() {
+                        bail!(
+                            "proxy is not running. Start the proxy first with 'proxy start' \
+                             before enabling takeover."
+                        );
+                    }
+                    if !running_in_process && external.is_some() {
+                        bail!(
+                            "proxy is running in another process (pid file detected). \
+                             Takeover state can only be modified from the owning process. \
+                             Stop it with 'proxy stop' first, or run takeover from the foreground CLI."
                         );
                     }
                     let enabled = optional_bool(&mut args, "--enabled", true)?;
@@ -840,15 +881,118 @@ fn cmd_backup(app: &HeadlessApp, mut args: Vec<String>) -> Result<Value> {
     }
 }
 
+async fn cmd_payload(app: &HeadlessApp, mut args: Vec<String>) -> Result<Value> {
+    let sub = if args.is_empty() {
+        bail!("payload subcommand is required (search | get | session | stats | export | prune)");
+    } else {
+        args.remove(0)
+    };
+
+    match sub.as_str() {
+        "search" => {
+            let query = required_value(&mut args, "--query")?;
+            let start = take_value(&mut args, "--start")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let end = take_value(&mut args, "--end")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let app_filter = take_value(&mut args, "--app")?;
+            Ok(serde_json::to_value(
+                cc_switch_lib::PayloadService::search(
+                    &app.state,
+                    &query,
+                    start,
+                    end,
+                    app_filter.as_deref(),
+                )?,
+            )?)
+        }
+        "get" => {
+            let id = required_value(&mut args, "--id")?;
+            Ok(serde_json::to_value(
+                cc_switch_lib::PayloadService::get(&app.state, &id)?,
+            )?)
+        }
+        "session" => {
+            let id = required_value(&mut args, "--id")?;
+            Ok(serde_json::to_value(
+                cc_switch_lib::PayloadService::session(&app.state, &id)?,
+            )?)
+        }
+        "stats" => {
+            let start = take_value(&mut args, "--start")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let end = take_value(&mut args, "--end")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let group_by = take_value(&mut args, "--group-by")?
+                .unwrap_or_else(|| "model".to_string());
+            Ok(serde_json::to_value(
+                cc_switch_lib::PayloadService::stats(
+                    &app.state, start, end, &group_by,
+                )?,
+            )?)
+        }
+        "export" => {
+            let output = required_value(&mut args, "--output")?;
+            let start = take_value(&mut args, "--start")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let end = take_value(&mut args, "--end")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let count =
+                cc_switch_lib::PayloadService::export(&app.state, start, end, &output)?;
+            Ok(serde_json::json!({ "exported": count, "path": output }))
+        }
+        "prune" => {
+            let before = required_value(&mut args, "--before")?;
+            let before_ts: i64 = before.parse()?;
+            let dry_run = take_bool(&mut args, "--dry-run");
+            let count = cc_switch_lib::PayloadService::prune(
+                &app.state, before_ts, dry_run,
+            )?;
+            Ok(serde_json::json!({
+                "would_delete": count,
+                "dry_run": dry_run,
+            }))
+        }
+        other => bail!("unsupported payload subcommand: {other}"),
+    }
+}
+
 async fn run() -> Result<()> {
     let cli = parse_cli()?;
     if cli.args.is_empty() {
         bail!("command is required");
     }
 
+    // Only recover proxy crash state when the explicit intent is to start the
+    // proxy. Read-only sibling commands (status, provider list, config, etc.)
+    // must not trigger recover_from_crash, which would tear down an already
+    // running proxy.
+    let first_arg = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+    let is_proxy_start = first_arg == "proxy"
+        && cli.args.get(1).map(|s| s.as_str()) == Some("start");
+
+    // HeadlessApp::init(recover_proxy=true) runs recover_from_crash, which
+    // mutates live config & deletes backup files. If another proxy process
+    // already owns the PID file, we must refuse before init to avoid tearing
+    // down the active proxy's takeover state.
+    if is_proxy_start {
+        if let Some(rec) = external_running(&cli) {
+            bail!(
+                "another proxy is already running (pid={}, port={}).                  Stop it with 'proxy stop' first, or check with 'proxy status'.",
+                rec.pid, rec.port
+            );
+        }
+    }
+
     let app = HeadlessApp::init(HeadlessOptions {
         config_dir: cli.config_dir.clone(),
-        recover_proxy: true,
+        recover_proxy: is_proxy_start,
     })
     .await?;
 
@@ -863,6 +1007,7 @@ async fn run() -> Result<()> {
         "usage" => cmd_usage(&app, &cli, args)?,
         "config" => cmd_config(&app, args)?,
         "backup" => cmd_backup(&app, args)?,
+        "payload" => cmd_payload(&app, args).await?,
         other => bail!("unsupported command: {other}"),
     };
 
@@ -871,6 +1016,13 @@ async fn run() -> Result<()> {
 
 #[tokio::main]
 async fn main() {
+    let is_proxy_start = std::env::args().collect::<Vec<_>>().windows(2)
+        .any(|w| w[0] == "proxy" && w[1] == "start");
+    let default_level = if is_proxy_start { "info" } else { "warn" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .format_timestamp_secs()
+        .init();
+
     if let Err(err) = run().await {
         eprintln!("{err:#}");
         std::process::exit(1);
