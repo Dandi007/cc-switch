@@ -182,6 +182,7 @@ async fn handle_messages_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let api_format = result
         .claude_api_format
         .as_deref()
@@ -357,6 +358,7 @@ async fn handle_claude_transform(
             usage_collector,
             timeout_config,
             connection_guard,
+            None,
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -693,6 +695,7 @@ pub async fn handle_chat_completions(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let response = result.response;
 
     process_response(
@@ -781,6 +784,7 @@ pub async fn handle_responses(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let response = result.response;
 
     process_response(
@@ -855,6 +859,7 @@ pub async fn handle_responses_compact(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let response = result.response;
 
     process_response(
@@ -936,6 +941,7 @@ pub async fn handle_gemini(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let response = result.response;
 
     process_response(
