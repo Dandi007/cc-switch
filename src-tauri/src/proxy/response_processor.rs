@@ -292,6 +292,7 @@ pub async fn handle_non_streaming(
                     &ctx.request_model,
                     status.as_u16(),
                     false,
+                    Some(request_id.clone()),
                 );
                 spawn_log_payload(
                     state,
@@ -308,6 +309,7 @@ pub async fn handle_non_streaming(
                     .and_then(|m| m.as_str())
                     .unwrap_or(&ctx.request_model)
                     .to_string();
+                let fallback_request_id = TokenUsage::default().dedup_request_id();
                 spawn_log_usage(
                     state,
                     ctx,
@@ -316,6 +318,7 @@ pub async fn handle_non_streaming(
                     &ctx.request_model,
                     status.as_u16(),
                     false,
+                    Some(fallback_request_id.clone()),
                 );
                 spawn_log_payload(
                     state,
@@ -324,7 +327,7 @@ pub async fn handle_non_streaming(
                     Some(json_value.clone()),
                     None,
                     None,
-                    &TokenUsage::default().dedup_request_id(),
+                    &fallback_request_id,
                 );
                 log::debug!(
                     "[{}] 未能解析 usage 信息，跳过记录",
@@ -345,6 +348,7 @@ pub async fn handle_non_streaming(
                 &ctx.request_model,
                 status.as_u16(),
                 false,
+                None,
             );
         }
     } else {
@@ -556,6 +560,7 @@ fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        None,
                     )
                     .await;
                 });
@@ -580,6 +585,7 @@ fn create_usage_collector(
                         true, // is_streaming
                         status_code,
                         Some(session_id),
+                        None,
                     )
                     .await;
                 });
@@ -629,7 +635,7 @@ fn spawn_log_payload(
 ///
 /// 收集所有 SSE events，在流结束时聚合为完整 assistant message JSON，
 /// 然后调用 `spawn_log_payload` 写入数据库。
-fn create_payload_collector(
+pub(crate) fn create_payload_collector(
     ctx: &RequestContext,
     state: &ProxyState,
 ) -> Option<SseUsageCollector> {
@@ -657,16 +663,14 @@ fn create_payload_collector(
             let ctx = ctx_snapshot.clone();
 
             tokio::spawn(async move {
-                // 生成一个稳定的 request_id。streaming events 中没有 request_id，
-                // 这里用一个简单的实现：用 session_id + timestamp + model 做标识。
-                // 实际使用中 request_id 已在 usage logging 中通过 dedup_request_id 生成，
-                // payload 使用相同机制。由于 streaming 路径没有 TokenUsage，
-                // 这里简单起见使用 context 中的信息构造。
-                let request_id = format!(
-                    "stream-{}-{}",
-                    ctx.session_id,
-                    chrono::Utc::now().timestamp_millis()
-                );
+                // 从 SSE events 中提取 upstream message_id，和 usage logger 的
+                // dedup_request_id 保持一致（格式 "session:{message_id}"）
+                let message_id = events.iter().find_map(|e| {
+                    e.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())
+                });
+                let request_id = message_id
+                    .map(|mid| format!("session:{mid}"))
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
                 use super::usage::payload_logger::{PayloadLog, PayloadLogger};
                 let logger = PayloadLogger::new(&state.db);
@@ -704,6 +708,7 @@ fn spawn_log_usage(
     request_model: &str,
     status_code: u16,
     is_streaming: bool,
+    override_request_id: Option<String>,
 ) {
     // Check enable_logging before spawning the log task
     if let Ok(config) = state.config.try_read() {
@@ -720,6 +725,7 @@ fn spawn_log_usage(
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
 
+    let override_id = override_request_id;
     tokio::spawn(async move {
         log_usage_internal(
             &state,
@@ -733,6 +739,7 @@ fn spawn_log_usage(
             is_streaming,
             status_code,
             Some(session_id),
+            override_id,
         )
         .await;
     });
@@ -760,6 +767,7 @@ async fn log_usage_internal(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    override_request_id: Option<String>,
 ) {
     use super::usage::logger::UsageLogger;
 
@@ -772,7 +780,7 @@ async fn log_usage_internal(
         model
     };
 
-    let request_id = usage.dedup_request_id();
+    let request_id = override_request_id.unwrap_or_else(|| usage.dedup_request_id());
 
     log::debug!(
         "[{app_type}] 记录请求日志: id={request_id}, provider={provider_id}, model={model}, streaming={is_streaming}, status={status_code}, latency_ms={latency_ms}, first_token_ms={first_token_ms:?}, session={}, input={}, output={}, cache_read={}, cache_creation={}",
@@ -945,7 +953,7 @@ pub fn create_logged_passthrough_stream(
 /// 从 SSE events 聚合完整的 assistant message JSON
 ///
 /// 支持 OpenAI streaming (choices[].delta) 和 Anthropic streaming (delta) 两种格式。
-fn aggregate_sse_events(events: &[Value]) -> Value {
+pub(crate) fn aggregate_sse_events(events: &[Value]) -> Value {
     let mut text_parts = Vec::new();
     let mut reasoning_parts = Vec::new();
     let mut tool_calls = Vec::new();
@@ -1231,6 +1239,7 @@ mod tests {
             false,
             200,
             None,
+            None,
         )
         .await;
 
@@ -1290,6 +1299,7 @@ mod tests {
             None,
             false,
             200,
+            None,
             None,
         )
         .await;

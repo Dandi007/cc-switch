@@ -22,9 +22,9 @@ use super::{
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, process_response, read_decoded_body,
-        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
-        usage_logging_enabled, SseUsageCollector,
+        aggregate_sse_events, create_logged_passthrough_stream, create_payload_collector,
+        process_response, read_decoded_body, strip_entity_headers_for_rebuilt_body,
+        strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
@@ -304,49 +304,74 @@ async fn handle_claude_transform(
             Box::new(Box::pin(create_anthropic_sse_stream(stream)))
         };
 
-        // 创建使用量收集器；关闭 usage logging 时不要再解析转换后的 SSE。
-        let usage_collector = if usage_logging_enabled(state) {
+        // 创建使用量 + payload 收集器（合并到同一个回调，确保 request_id 一致）
+        let captured_request_body = ctx.captured_request_body.clone();
+        let usage_collector = {
             let state = state.clone();
             let provider_id = ctx.provider.id.clone();
             let model = ctx.request_model.clone();
             let status_code = status.as_u16();
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
+            let logging_enabled = usage_logging_enabled(&state);
 
             Some(SseUsageCollector::new(
                 start_time,
-                Some(claude_stream_usage_event_filter),
+                None, // 收集所有 events（payload 需要完整内容）
                 move |events, first_token_ms| {
-                    if let Some(usage) = TokenUsage::from_claude_stream_events(&events) {
-                        let latency_ms = start_time.elapsed().as_millis() as u64;
-                        let state = state.clone();
-                        let provider_id = provider_id.clone();
-                        let model = model.clone();
-                        let session_id = session_id.clone();
+                    let usage = TokenUsage::from_claude_stream_events(&events);
+                    let request_id = usage
+                        .as_ref()
+                        .map(|u| u.dedup_request_id())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-                        tokio::spawn(async move {
-                            log_usage(
-                                &state,
-                                &provider_id,
-                                "claude",
-                                &model,
-                                &model,
-                                usage,
-                                latency_ms,
-                                first_token_ms,
-                                true,
-                                status_code,
-                                Some(session_id),
-                            )
-                            .await;
-                        });
-                    } else {
-                        log::debug!("[Claude] OpenRouter 流式响应缺少 usage 统计，跳过消费记录");
-                    }
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    let state = state.clone();
+                    let provider_id = provider_id.clone();
+                    let model = model.clone();
+                    let session_id = session_id.clone();
+                    let captured_body = captured_request_body.clone();
+                    let aggregated = aggregate_sse_events(&events);
+
+                    tokio::spawn(async move {
+                        // 记录 usage
+                        if logging_enabled {
+                            if let Some(usage) = usage {
+                                log_usage(
+                                    &state,
+                                    &provider_id,
+                                    "claude",
+                                    &model,
+                                    &model,
+                                    usage,
+                                    latency_ms,
+                                    first_token_ms,
+                                    true,
+                                    status_code,
+                                    Some(session_id),
+                                )
+                                .await;
+                            }
+                        }
+                        // 记录 payload（和 usage 共享 request_id）
+                        if let Some(req) = captured_body {
+                            use crate::proxy::usage::payload_logger::{PayloadLog, PayloadLogger};
+                            let logger = PayloadLogger::new(&state.db);
+                            let log = PayloadLog {
+                                request_id,
+                                request_body: req,
+                                response_body: Some(aggregated),
+                                request_headers: None,
+                                response_headers: None,
+                                created_at: chrono::Utc::now().timestamp(),
+                            };
+                            if let Err(e) = logger.log_payload(log) {
+                                log::warn!("payload 记录失败 (claude stream): {e}");
+                            }
+                        }
+                    });
                 },
             ))
-        } else {
-            None
         };
 
         // 获取流式超时配置
@@ -358,7 +383,7 @@ async fn handle_claude_transform(
             usage_collector,
             timeout_config,
             connection_guard,
-            None,
+            None, // payload 已在 usage_collector 回调中处理
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -418,35 +443,75 @@ async fn handle_claude_transform(
         e
     })?;
 
-    // 记录使用量
-    if let Some(usage) = TokenUsage::from_claude_response(&anthropic_response) {
+    // 记录使用量 + payload（共享 request_id）
+    {
+        let usage = TokenUsage::from_claude_response(&anthropic_response);
+        let request_id = usage
+            .as_ref()
+            .map(|u| u.dedup_request_id())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let model = anthropic_response
             .get("model")
             .and_then(|m| m.as_str())
-            .unwrap_or("unknown");
+            .unwrap_or("unknown")
+            .to_string();
         let latency_ms = ctx.latency_ms();
-
         let request_model = ctx.request_model.clone();
+        let request_body = ctx.captured_request_body.clone();
+        let response_body = anthropic_response.clone();
+
         tokio::spawn({
             let state = state.clone();
             let provider_id = ctx.provider.id.clone();
-            let model = model.to_string();
             let session_id = ctx.session_id.clone();
+            let request_id = request_id.clone();
             async move {
-                log_usage(
-                    &state,
-                    &provider_id,
-                    "claude",
-                    &model,
-                    &request_model,
-                    usage,
-                    latency_ms,
-                    None,
-                    false,
-                    status.as_u16(),
-                    Some(session_id),
-                )
-                .await;
+                if let Some(usage) = usage {
+                    use super::usage::logger::UsageLogger;
+                    let logger = UsageLogger::new(&state.db);
+                    let (multiplier, pricing_model_source) =
+                        logger.resolve_pricing_config(&provider_id, "claude").await;
+                    let pricing_model = if pricing_model_source
+                        == crate::database::PRICING_SOURCE_REQUEST
+                    {
+                        request_model.clone()
+                    } else {
+                        model.clone()
+                    };
+                    if let Err(e) = logger.log_with_calculation(
+                        request_id.clone(),
+                        provider_id,
+                        "claude".to_string(),
+                        model,
+                        request_model,
+                        pricing_model,
+                        usage,
+                        multiplier,
+                        latency_ms,
+                        None,
+                        status.as_u16(),
+                        Some(session_id),
+                        None,
+                        false,
+                    ) {
+                        log::warn!("[Claude] usage 记录失败: {e}");
+                    }
+                }
+                if let Some(req) = request_body {
+                    use crate::proxy::usage::payload_logger::{PayloadLog, PayloadLogger};
+                    let logger = PayloadLogger::new(&state.db);
+                    let log = PayloadLog {
+                        request_id,
+                        request_body: req,
+                        response_body: Some(response_body),
+                        request_headers: None,
+                        response_headers: None,
+                        created_at: chrono::Utc::now().timestamp(),
+                    };
+                    if let Err(e) = logger.log_payload(log) {
+                        log::warn!("payload 记录失败 (claude transform): {e}");
+                    }
+                }
             }
         });
     }
