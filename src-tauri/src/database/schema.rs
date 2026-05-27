@@ -229,8 +229,7 @@ impl Database {
                 extracted_tools TEXT,
                 extracted_thinking TEXT,
                 payload_size_bytes INTEGER DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY (request_id) REFERENCES proxy_request_logs(request_id)
+                created_at INTEGER NOT NULL
             )",
             [],
         )
@@ -461,6 +460,38 @@ impl Database {
                         log::info!("迁移数据库从 v10 到 v11（添加 payload recording 支持）");
                         Self::migrate_v10_to_v11(conn)?;
                         Self::set_user_version(conn, 11)?;
+                    }
+                    11 => {
+                        log::info!("迁移数据库从 v11 到 v12（去掉 payloads FK 约束）");
+                        conn.execute_batch(
+                            "DROP TABLE IF EXISTS proxy_payload_fts;
+                             CREATE TABLE IF NOT EXISTS proxy_request_payloads_new (
+                                 request_id TEXT PRIMARY KEY,
+                                 request_body TEXT NOT NULL,
+                                 response_body TEXT,
+                                 request_headers TEXT,
+                                 response_headers TEXT,
+                                 extracted_user_message TEXT,
+                                 extracted_assistant_message TEXT,
+                                 extracted_tools TEXT,
+                                 extracted_thinking TEXT,
+                                 payload_size_bytes INTEGER DEFAULT 0,
+                                 created_at INTEGER NOT NULL
+                             );
+                             INSERT OR IGNORE INTO proxy_request_payloads_new SELECT * FROM proxy_request_payloads;
+                             DROP TABLE proxy_request_payloads;
+                             ALTER TABLE proxy_request_payloads_new RENAME TO proxy_request_payloads;
+                             CREATE INDEX IF NOT EXISTS idx_payloads_created ON proxy_request_payloads(created_at);
+                             CREATE VIRTUAL TABLE IF NOT EXISTS proxy_payload_fts USING fts5(
+                                 extracted_user_message,
+                                 extracted_assistant_message,
+                                 extracted_thinking,
+                                 content=proxy_request_payloads,
+                                 content_rowid=rowid
+                             );",
+                        )
+                        .map_err(|e| AppError::Database(format!("v12 migration 失败: {e}")))?;
+                        Self::set_user_version(conn, 12)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
