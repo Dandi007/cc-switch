@@ -881,6 +881,88 @@ fn cmd_backup(app: &HeadlessApp, mut args: Vec<String>) -> Result<Value> {
     }
 }
 
+async fn cmd_payload(app: &HeadlessApp, mut args: Vec<String>) -> Result<Value> {
+    let sub = if args.is_empty() {
+        bail!("payload subcommand is required (search | get | session | stats | export | prune)");
+    } else {
+        args.remove(0)
+    };
+
+    match sub.as_str() {
+        "search" => {
+            let query = required_value(&mut args, "--query")?;
+            let start = take_value(&mut args, "--start")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let end = take_value(&mut args, "--end")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let app_filter = take_value(&mut args, "--app")?;
+            Ok(serde_json::to_value(
+                cc_switch_lib::PayloadService::search(
+                    &app.state,
+                    &query,
+                    start,
+                    end,
+                    app_filter.as_deref(),
+                )?,
+            )?)
+        }
+        "get" => {
+            let id = required_value(&mut args, "--id")?;
+            Ok(serde_json::to_value(
+                cc_switch_lib::PayloadService::get(&app.state, &id)?,
+            )?)
+        }
+        "session" => {
+            let id = required_value(&mut args, "--id")?;
+            Ok(serde_json::to_value(
+                cc_switch_lib::PayloadService::session(&app.state, &id)?,
+            )?)
+        }
+        "stats" => {
+            let start = take_value(&mut args, "--start")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let end = take_value(&mut args, "--end")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let group_by = take_value(&mut args, "--group-by")?
+                .unwrap_or_else(|| "model".to_string());
+            Ok(serde_json::to_value(
+                cc_switch_lib::PayloadService::stats(
+                    &app.state, start, end, &group_by,
+                )?,
+            )?)
+        }
+        "export" => {
+            let output = required_value(&mut args, "--output")?;
+            let start = take_value(&mut args, "--start")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let end = take_value(&mut args, "--end")?
+                .map(|v| v.parse::<i64>())
+                .transpose()?;
+            let count =
+                cc_switch_lib::PayloadService::export(&app.state, start, end, &output)?;
+            Ok(serde_json::json!({ "exported": count, "path": output }))
+        }
+        "prune" => {
+            let before = required_value(&mut args, "--before")?;
+            let before_ts: i64 = before.parse()?;
+            let dry_run = take_bool(&mut args, "--dry-run");
+            let count = cc_switch_lib::PayloadService::prune(
+                &app.state, before_ts, dry_run,
+            )?;
+            Ok(serde_json::json!({
+                "would_delete": count,
+                "dry_run": dry_run,
+            }))
+        }
+        other => bail!("unsupported payload subcommand: {other}"),
+    }
+}
+
 async fn run() -> Result<()> {
     let cli = parse_cli()?;
     if cli.args.is_empty() {
@@ -925,6 +1007,7 @@ async fn run() -> Result<()> {
         "usage" => cmd_usage(&app, &cli, args)?,
         "config" => cmd_config(&app, args)?,
         "backup" => cmd_backup(&app, args)?,
+        "payload" => cmd_payload(&app, args).await?,
         other => bail!("unsupported command: {other}"),
     };
 
