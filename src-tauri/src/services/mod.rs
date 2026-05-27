@@ -20,6 +20,7 @@ pub mod stream_check;
 pub mod subscription;
 pub mod usage_cache;
 pub mod usage_stats;
+pub mod payload;
 pub mod webdav;
 pub mod webdav_auto_sync;
 pub mod webdav_sync;
