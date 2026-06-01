@@ -127,13 +127,24 @@ impl CachedModelCapabilityResolver {
     /// Returns `None` if no key is configured — the probe will still be sent
     /// (some providers don't require auth for `/v1/models`).
     pub(crate) fn extract_api_key(provider: &Provider) -> Option<String> {
-        // Helper: resolve ${VAR} references in the key string
+        // Helper: resolve env-var placeholders in the key string.
+        // ccs canonical format is `{env:NAME}` (mirrors providers::claude::resolve_env_reference);
+        // also tolerate `${NAME}`. Falls back to the literal on unset/unknown var.
         fn resolve_env_ref(value: &str) -> String {
-            if let Some(var) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-                std::env::var(var).unwrap_or_else(|_| value.to_string())
-            } else {
-                value.to_string()
+            let trimmed = value.trim();
+            if let Some(name) = trimmed
+                .strip_prefix("{env:")
+                .and_then(|s| s.strip_suffix('}'))
+            {
+                return std::env::var(name).unwrap_or_else(|_| value.to_string());
             }
+            if let Some(name) = trimmed
+                .strip_prefix("${")
+                .and_then(|s| s.strip_suffix('}'))
+            {
+                return std::env::var(name).unwrap_or_else(|_| value.to_string());
+            }
+            value.to_string()
         }
 
         // 1. env.ANTHROPIC_AUTH_TOKEN (Bearer token — highest priority)
@@ -387,6 +398,27 @@ mod tests {
         };
         let key = CachedModelCapabilityResolver::extract_api_key(&provider);
         assert_eq!(key.as_deref(), Some("sk-test-key-123"));
+    }
+
+    #[test]
+    fn extract_api_key_resolves_env_placeholder() {
+        // ccs stores secrets as `{env:NAME}` (e.g. lingzhi apiKey="{env:LINGZHI_API_KEY}").
+        // extract_api_key must resolve it to the real value, not return the literal placeholder.
+        std::env::set_var("CCS_TEST_LINGZHI_KEY", "sk-resolved-live-key");
+        let provider = Provider {
+            id: "lingzhi".to_string(),
+            name: "Lingzhi".to_string(),
+            settings_config: serde_json::json!({
+                "apiKey": "{env:CCS_TEST_LINGZHI_KEY}",
+                "base_url": "https://lingzhi.agibot.com/v1"
+            }),
+            ..default_provider()
+        };
+        let key = CachedModelCapabilityResolver::extract_api_key(&provider);
+        std::env::remove_var("CCS_TEST_LINGZHI_KEY");
+        assert_eq!(key.as_deref(), Some("sk-resolved-live-key"));
+        // never leak an unresolved placeholder into the Bearer header
+        assert!(!key.unwrap().contains("{env:"));
     }
 
     #[test]
