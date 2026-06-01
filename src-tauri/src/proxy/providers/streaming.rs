@@ -249,7 +249,17 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                         }
 
                                         // 处理 reasoning（thinking）
-                                        if let Some(reasoning) = &choice.delta.reasoning {
+                                        // 仅当 reasoning 非空时才开/切到 thinking 块——与下方 content
+                                        // 处理保持一致。部分上游（如 qwen3.7-max）会在 content 之后/之间
+                                        // 持续发送 reasoning_content:""（空串而非 null），若不过滤会在文本块
+                                        // 之后再开一个空 thinking 块，使 Anthropic 流以空 thinking 块收尾，
+                                        // 导致 Claude Code 解析出空结果。
+                                        if let Some(reasoning) = choice
+                                            .delta
+                                            .reasoning
+                                            .as_deref()
+                                            .filter(|r| !r.is_empty())
+                                        {
                                             if current_non_tool_block_type != Some("thinking") {
                                                 if let Some(index) = current_non_tool_block_index.take() {
                                                     let event = json!({
@@ -1103,6 +1113,61 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event_type(event) == Some("message_stop")));
+    }
+
+    #[tokio::test]
+    async fn test_empty_reasoning_content_does_not_open_spurious_thinking_block() {
+        // Regression: qwen3.7-max emits `reasoning_content:""` (empty string, present
+        // i.e. Some("")) interleaved with and after `content`. The reasoning handler must
+        // ignore empty reasoning strings exactly like the content handler ignores empty
+        // content — otherwise an empty reasoning delta arriving after the text block forces
+        // a switch back to a `thinking` block, leaving the Anthropic stream ending on a
+        // spurious empty thinking block. Claude Code then extracts an empty result.
+        let input = concat!(
+            "data: {\"id\":\"q\",\"model\":\"qwen3.7-max\",\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\",\"reasoning_content\":\"\"}}]}\n\n",
+            "data: {\"id\":\"q\",\"model\":\"qwen3.7-max\",\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"Think\"}}]}\n\n",
+            "data: {\"id\":\"q\",\"model\":\"qwen3.7-max\",\"choices\":[{\"delta\":{\"content\":\"QWEN_OK\",\"reasoning_content\":\"\"}}]}\n\n",
+            "data: {\"id\":\"q\",\"model\":\"qwen3.7-max\",\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+
+        // Block-start types must be exactly [thinking, text] — no trailing thinking block.
+        let block_types: Vec<String> = events
+            .iter()
+            .filter(|e| event_type(e) == Some("content_block_start"))
+            .filter_map(|e| {
+                e.pointer("/content_block/type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        assert_eq!(
+            block_types,
+            vec!["thinking".to_string(), "text".to_string()],
+            "expected exactly [thinking, text] blocks, got {block_types:?}"
+        );
+
+        // The visible answer must survive as a text_delta.
+        let text: String = events
+            .iter()
+            .filter(|e| event_type(e) == Some("content_block_delta"))
+            .filter(|e| e.pointer("/delta/type").and_then(|v| v.as_str()) == Some("text_delta"))
+            .filter_map(|e| e.pointer("/delta/text").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(text, "QWEN_OK");
+
+        // No empty thinking_delta events should be emitted.
+        let empty_thinking = events
+            .iter()
+            .filter(|e| event_type(e) == Some("content_block_delta"))
+            .filter(|e| {
+                e.pointer("/delta/type").and_then(|v| v.as_str()) == Some("thinking_delta")
+            })
+            .filter(|e| e.pointer("/delta/thinking").and_then(|v| v.as_str()) == Some(""))
+            .count();
+        assert_eq!(empty_thinking, 0, "empty thinking_delta must not be emitted");
     }
 
     #[tokio::test]
