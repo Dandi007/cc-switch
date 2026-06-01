@@ -3077,7 +3077,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_claude_api_format_capability_unavailable_falls_back() {
         let provider = provider_with_api_format("openai_chat");
-        let mut forwarder = test_forwarder(
+        let forwarder = test_forwarder(
             Duration::from_secs(30),
             Duration::from_secs(30),
         );
