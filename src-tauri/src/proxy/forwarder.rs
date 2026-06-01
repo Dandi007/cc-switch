@@ -9,6 +9,7 @@ use super::{
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
     log_codes::fwd as log_fwd,
+    model_capability::ModelCapabilityResolver,
     provider_router::ProviderRouter,
     providers::{
         gemini_shadow::GeminiShadowStore, get_adapter, AuthInfo, AuthStrategy, ProviderAdapter,
@@ -121,6 +122,11 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// Per-model capability resolver for the non-copilot path.
+    ///
+    /// When `None` (e.g. in tests), `provider_model_supports_anthropic` returns
+    /// `false` — the caller falls back to the provider-level base format.
+    model_capability: Option<Arc<dyn ModelCapabilityResolver>>,
 }
 
 impl RequestForwarder {
@@ -143,6 +149,7 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        model_capability: Option<Arc<dyn ModelCapabilityResolver>>,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -166,6 +173,7 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            model_capability,
         }
     }
 
@@ -1762,7 +1770,18 @@ impl RequestForwarder {
         is_copilot: bool,
     ) -> String {
         if !is_copilot {
-            return super::providers::get_claude_api_format(provider).to_string();
+            let base = super::providers::get_claude_api_format(provider).to_string();
+            // Only per-model override when the base format would trigger a transform
+            // (openai_chat | openai_responses | gemini_native). anthropic passthrough
+            // does not need transform, so we leave it alone.
+            if super::providers::claude_api_format_needs_transform(&base) {
+                if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+                    if self.provider_model_supports_anthropic(provider, model).await {
+                        return "anthropic".to_string();
+                    }
+                }
+            }
+            return base;
         }
 
         let model = body.get("model").and_then(|value| value.as_str());
@@ -1776,6 +1795,22 @@ impl RequestForwarder {
         }
 
         "openai_chat".to_string()
+    }
+
+    /// Check whether a specific model supports the Anthropic-native format.
+    ///
+    /// Delegates to the injected `ModelCapabilityResolver`. When no resolver is
+    /// configured (e.g. in tests), returns `false` — the caller falls back to the
+    /// provider-level base format.
+    async fn provider_model_supports_anthropic(
+        &self,
+        provider: &Provider,
+        model: &str,
+    ) -> bool {
+        match &self.model_capability {
+            Some(resolver) => resolver.supports_anthropic(provider, model).await,
+            None => false,
+        }
     }
 
     /// 用 Copilot live `/models` 列表确认 model ID 真实可用，找不到时按 family 降级。
@@ -2295,12 +2330,14 @@ fn value_for_log(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::database::Database;
+    use crate::proxy::model_capability::FixedModelCapabilityResolver;
     use axum::http::header::{HeaderValue, ACCEPT};
     use axum::http::HeaderMap;
     use bytes::Bytes;
     use http::StatusCode;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn test_provider_with_type(provider_type: Option<&str>) -> Provider {
@@ -2346,6 +2383,7 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            model_capability: None,
         }
     }
 
@@ -2949,5 +2987,144 @@ mod tests {
             let will_replace = is_copilot && !is_full_url;
             assert_eq!(will_replace, should_replace, "{desc}");
         }
+    }
+
+    // ==================== resolve_claude_api_format 单测 ====================
+
+    /// Helper: create a Provider with `meta.apiFormat = "openai_chat"`.
+    fn provider_with_api_format(api_format: &str) -> Provider {
+        Provider {
+            id: "test-provider".to_string(),
+            name: "Test Provider".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(crate::provider::ProviderMeta {
+                api_format: Some(api_format.to_string()),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
+    /// Helper: create a forwarder with a `FixedModelCapabilityResolver` injected.
+    fn forwarder_with_capability(
+        answers: HashMap<String, bool>,
+        default: bool,
+    ) -> RequestForwarder {
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let resolver = Arc::new(FixedModelCapabilityResolver { answers, default });
+
+        RequestForwarder {
+            router: Arc::new(ProviderRouter::new(db.clone())),
+            status: Arc::new(RwLock::new(ProxyStatus::default())),
+            current_providers: Arc::new(RwLock::new(HashMap::new())),
+            gemini_shadow: Arc::new(GeminiShadowStore::new()),
+            failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+            app_handle: None,
+            managed_auth: crate::proxy::server::ManagedAuthRegistry::default(),
+            current_provider_id_at_start: String::new(),
+            session_id: String::new(),
+            session_client_provided: false,
+            rectifier_config: RectifierConfig::default(),
+            optimizer_config: OptimizerConfig::default(),
+            copilot_optimizer_config: CopilotOptimizerConfig::default(),
+            non_streaming_timeout: Duration::from_secs(30),
+            streaming_first_byte_timeout: Duration::from_secs(30),
+            max_attempts: 1,
+            model_capability: Some(resolver),
+        }
+    }
+
+    /// (a) base=openai_chat + model 支持 anthropic → 返回 "anthropic"
+    #[tokio::test]
+    async fn resolve_claude_api_format_model_supports_anthropic() {
+        let provider = provider_with_api_format("openai_chat");
+        let mut answers = HashMap::new();
+        answers.insert("claude-opus-4-8".to_string(), true);
+        let forwarder = forwarder_with_capability(answers, false);
+
+        let body = json!({"model": "claude-opus-4-8"});
+        let format = forwarder
+            .resolve_claude_api_format(&provider, &body, false)
+            .await;
+
+        assert_eq!(format, "anthropic");
+    }
+
+    /// (b) base=openai_chat + model 仅支持 openai → 返回 "openai_chat"
+    #[tokio::test]
+    async fn resolve_claude_api_format_model_only_openai() {
+        let provider = provider_with_api_format("openai_chat");
+        let mut answers = HashMap::new();
+        answers.insert("deepseek-v4-pro".to_string(), false);
+        let forwarder = forwarder_with_capability(answers, false);
+
+        let body = json!({"model": "deepseek-v4-pro"});
+        let format = forwarder
+            .resolve_claude_api_format(&provider, &body, false)
+            .await;
+
+        assert_eq!(format, "openai_chat");
+    }
+
+    /// (c) capability 不可用（注入 None）→ 回落 base（不 panic、不阻断）
+    #[tokio::test]
+    async fn resolve_claude_api_format_capability_unavailable_falls_back() {
+        let provider = provider_with_api_format("openai_chat");
+        let forwarder = test_forwarder(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
+        // model_capability is None → provider_model_supports_anthropic returns false
+        assert!(forwarder.model_capability.is_none());
+
+        let body = json!({"model": "claude-opus-4-8"});
+        let format = forwarder
+            .resolve_claude_api_format(&provider, &body, false)
+            .await;
+
+        // Should fall back to base = openai_chat
+        assert_eq!(format, "openai_chat");
+    }
+
+    /// base=anthropic should NOT trigger per-model check (no transform needed)
+    #[tokio::test]
+    async fn resolve_claude_api_format_anthropic_base_passthrough() {
+        let provider = provider_with_api_format("anthropic");
+        // Even with capability resolver that says "yes", anthropic base is
+        // already passthrough — should not touch the resolver.
+        let mut answers = HashMap::new();
+        answers.insert("claude-opus-4-8".to_string(), true);
+        let forwarder = forwarder_with_capability(answers, false);
+
+        let body = json!({"model": "claude-opus-4-8"});
+        let format = forwarder
+            .resolve_claude_api_format(&provider, &body, false)
+            .await;
+
+        assert_eq!(format, "anthropic");
+    }
+
+    /// No model in body → fall back to base
+    #[tokio::test]
+    async fn resolve_claude_api_format_no_model_in_body_falls_back() {
+        let provider = provider_with_api_format("openai_chat");
+        let mut answers = HashMap::new();
+        answers.insert("claude-opus-4-8".to_string(), true);
+        let forwarder = forwarder_with_capability(answers, false);
+
+        // Body has no "model" field
+        let body = json!({"prompt": "hello"});
+        let format = forwarder
+            .resolve_claude_api_format(&provider, &body, false)
+            .await;
+
+        assert_eq!(format, "openai_chat");
     }
 }

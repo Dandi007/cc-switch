@@ -10,6 +10,7 @@
 
 use super::{
     failover_switch::FailoverSwitchManager, handlers, log_codes::srv as log_srv,
+    model_capability::CachedModelCapabilityResolver,
     provider_router::ProviderRouter, providers::gemini_shadow::GeminiShadowStore, types::*,
     ProxyError,
 };
@@ -53,6 +54,8 @@ pub struct ProxyState {
     pub managed_auth: ManagedAuthRegistry,
     /// 故障转移切换管理器
     pub failover_manager: Arc<FailoverSwitchManager>,
+    /// Per-model capability resolver (cached, shared across all forwarders).
+    pub model_capability: Arc<CachedModelCapabilityResolver>,
 }
 
 /// 代理HTTP服务器
@@ -87,6 +90,7 @@ impl ProxyServer {
             app_handle,
             managed_auth,
             failover_manager,
+            model_capability: Arc::new(CachedModelCapabilityResolver::new()),
         };
 
         Self {

@@ -7,6 +7,7 @@ use super::{
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::ProxyResponse,
+    model_capability::CachedModelCapabilityResolver,
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
     usage::parser::TokenUsage,
@@ -1163,6 +1164,7 @@ mod tests {
             app_handle: None,
             managed_auth: crate::proxy::server::ManagedAuthRegistry::default(),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+            model_capability: Arc::new(CachedModelCapabilityResolver::new()),
         }
     }
 

@@ -16,7 +16,7 @@ use super::{
     },
     handler_context::RequestContext,
     providers::{
-        get_adapter, get_claude_api_format, streaming::create_anthropic_sse_stream,
+        get_claude_api_format, streaming::create_anthropic_sse_stream,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
         transform_gemini, transform_responses,
@@ -190,9 +190,10 @@ async fn handle_messages_for_app(
         .to_string();
     let response = result.response;
 
-    // 检查是否需要格式转换（OpenRouter 等中转服务）
-    let adapter = get_adapter(&app_type);
-    let needs_transform = adapter.needs_transform(&ctx.provider);
+    // 检查是否需要格式转换：基于「按 model 解析后的」api_format（与请求侧 forwarder.rs
+    // 的 needs_transform 判定一致），而非 provider 基础格式。否则 per-model 把请求覆盖成
+    // anthropic 时，响应仍按 openai 转换 → openai_to_anthropic 报 "No choices in response"（422）。
+    let needs_transform = super::providers::claude_api_format_needs_transform(&api_format);
 
     // Claude 特有：格式转换处理
     if needs_transform {
