@@ -247,6 +247,7 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            Some(state.model_capability.clone()),
         )
     }
 

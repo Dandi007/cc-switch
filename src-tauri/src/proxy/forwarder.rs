@@ -9,6 +9,7 @@ use super::{
     failover_switch::FailoverSwitchManager,
     json_canonical::{canonicalize_value, short_value_hash},
     log_codes::fwd as log_fwd,
+    model_capability::ModelCapabilityResolver,
     provider_router::ProviderRouter,
     providers::{
         gemini_shadow::GeminiShadowStore, get_adapter, AuthInfo, AuthStrategy, ProviderAdapter,
@@ -121,6 +122,11 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// Per-model capability resolver for the non-copilot path.
+    ///
+    /// When `None` (e.g. in tests), `provider_model_supports_anthropic` returns
+    /// `false` — the caller falls back to the provider-level base format.
+    model_capability: Option<Arc<dyn ModelCapabilityResolver>>,
 }
 
 impl RequestForwarder {
@@ -143,6 +149,7 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        model_capability: Option<Arc<dyn ModelCapabilityResolver>>,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -166,6 +173,7 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            model_capability,
         }
     }
 
@@ -1762,7 +1770,18 @@ impl RequestForwarder {
         is_copilot: bool,
     ) -> String {
         if !is_copilot {
-            return super::providers::get_claude_api_format(provider).to_string();
+            let base = super::providers::get_claude_api_format(provider).to_string();
+            // Only per-model override when the base format would trigger a transform
+            // (openai_chat | openai_responses | gemini_native). anthropic passthrough
+            // does not need transform, so we leave it alone.
+            if super::providers::claude_api_format_needs_transform(&base) {
+                if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+                    if self.provider_model_supports_anthropic(provider, model).await {
+                        return "anthropic".to_string();
+                    }
+                }
+            }
+            return base;
         }
 
         let model = body.get("model").and_then(|value| value.as_str());
@@ -1776,6 +1795,22 @@ impl RequestForwarder {
         }
 
         "openai_chat".to_string()
+    }
+
+    /// Check whether a specific model supports the Anthropic-native format.
+    ///
+    /// Delegates to the injected `ModelCapabilityResolver`. When no resolver is
+    /// configured (e.g. in tests), returns `false` — the caller falls back to the
+    /// provider-level base format.
+    async fn provider_model_supports_anthropic(
+        &self,
+        provider: &Provider,
+        model: &str,
+    ) -> bool {
+        match &self.model_capability {
+            Some(resolver) => resolver.supports_anthropic(provider, model).await,
+            None => false,
+        }
     }
 
     /// 用 Copilot live `/models` 列表确认 model ID 真实可用，找不到时按 family 降级。
@@ -2346,6 +2381,7 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            model_capability: None,
         }
     }
 

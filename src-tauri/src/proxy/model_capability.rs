@@ -11,6 +11,8 @@
 
 use crate::provider::Provider;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -18,14 +20,13 @@ use tokio::sync::RwLock;
 /// Trait for querying whether a model supports the Anthropic-native format.
 ///
 /// This is injectable so that tests can provide pre-configured answers without
-/// hitting the network. The trait is implemented on `Arc<T>` so the resolver can
-/// be shared across the forwarder and its internal methods.
+/// hitting the network. The production implementation is `CachedModelCapabilityResolver`.
 pub trait ModelCapabilityResolver: Send + Sync {
     fn supports_anthropic(
         &self,
         provider: &Provider,
         model: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 }
 
 /// Simple mock resolver for tests — returns a fixed answer for every model.
@@ -41,7 +42,7 @@ impl ModelCapabilityResolver for FixedModelCapabilityResolver {
         &self,
         _provider: &Provider,
         model: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         let result = self.answers.get(model).copied().unwrap_or(self.default);
         Box::pin(std::future::ready(result))
     }
@@ -53,8 +54,8 @@ impl ModelCapabilityResolver for FixedModelCapabilityResolver {
 /// **Fail-safe**: any error (network, timeout, parse, missing field) → returns
 /// `false`, so the caller falls back to the provider-level base format.
 ///
-/// Use via `Arc<CachedModelCapabilityResolver>` — the trait is implemented on
-/// `Arc<Self>` so the cache lock is shared.
+/// Wrap in `Arc<CachedModelCapabilityResolver>` and pass as `Arc<dyn ModelCapabilityResolver>`
+/// for shared access across multiple forwarders.
 pub struct CachedModelCapabilityResolver {
     /// Cache key: `"{provider_id}:{model}"` → `(inserted_at, supports_anthropic)`.
     cache: RwLock<HashMap<String, (Instant, bool)>>,
@@ -86,7 +87,7 @@ impl CachedModelCapabilityResolver {
     }
 
     /// Extract the base URL from provider settings (same priority as ClaudeAdapter).
-    fn extract_base_url(provider: &Provider) -> Option<String> {
+    pub(crate) fn extract_base_url(provider: &Provider) -> Option<String> {
         // 1. env.ANTHROPIC_BASE_URL
         if let Some(env) = provider.settings_config.get("env") {
             if let Some(url) = env.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()) {
@@ -121,34 +122,33 @@ impl CachedModelCapabilityResolver {
     }
 }
 
-impl ModelCapabilityResolver for Arc<CachedModelCapabilityResolver> {
+impl ModelCapabilityResolver for CachedModelCapabilityResolver {
     fn supports_anthropic(
         &self,
         provider: &Provider,
         model: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
-        let this = Arc::clone(self);
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         let cache_key = format!("{}:{}", provider.id, model);
-        let base_url = CachedModelCapabilityResolver::extract_base_url(provider);
+        let base_url = Self::extract_base_url(provider);
         let model_owned = model.to_string();
 
         Box::pin(async move {
             // Check cache
             {
-                let cache = this.cache.read().await;
+                let cache = self.cache.read().await;
                 if let Some((ts, result)) = cache.get(&cache_key) {
-                    if ts.elapsed() < CachedModelCapabilityResolver::DEFAULT_TTL {
+                    if ts.elapsed() < Self::DEFAULT_TTL {
                         return *result;
                     }
                 }
             }
 
             // Cache miss — fetch from network
-            let result = this.do_fetch(&base_url, &model_owned).await;
+            let result = self.do_fetch(&base_url, &model_owned).await;
 
             // Update cache
             {
-                let mut cache = this.cache.write().await;
+                let mut cache = self.cache.write().await;
                 cache.insert(cache_key, (Instant::now(), result));
             }
 
