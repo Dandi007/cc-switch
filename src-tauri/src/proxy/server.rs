@@ -10,6 +10,7 @@
 
 use super::{
     failover_switch::FailoverSwitchManager, handlers, log_codes::srv as log_srv,
+    model_capability::CachedModelCapabilityResolver,
     provider_router::ProviderRouter, providers::gemini_shadow::GeminiShadowStore, types::*,
     ProxyError,
 };
@@ -24,6 +25,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
+
+use super::providers::{codex_oauth_auth::CodexOAuthManager, copilot_auth::CopilotAuthManager};
+
+/// Headless/GUI 共享的托管认证依赖。
+#[derive(Clone, Default)]
+pub struct ManagedAuthRegistry {
+    pub codex_oauth: Option<Arc<RwLock<CodexOAuthManager>>>,
+    pub copilot: Option<Arc<RwLock<CopilotAuthManager>>>,
+}
 
 /// 代理服务器状态（共享）
 #[derive(Clone)]
@@ -40,8 +50,12 @@ pub struct ProxyState {
     pub gemini_shadow: Arc<GeminiShadowStore>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
+    /// Headless 场景注入的托管认证 manager；GUI 场景可为空并回退到 AppHandle state。
+    pub managed_auth: ManagedAuthRegistry,
     /// 故障转移切换管理器
     pub failover_manager: Arc<FailoverSwitchManager>,
+    /// Per-model capability resolver (cached, shared across all forwarders).
+    pub model_capability: Arc<CachedModelCapabilityResolver>,
 }
 
 /// 代理HTTP服务器
@@ -58,6 +72,7 @@ impl ProxyServer {
         config: ProxyConfig,
         db: Arc<Database>,
         app_handle: Option<tauri::AppHandle>,
+        managed_auth: ManagedAuthRegistry,
     ) -> Self {
         // 创建共享的 ProviderRouter（熔断器状态将跨所有请求保持）
         let provider_router = Arc::new(ProviderRouter::new(db.clone()));
@@ -73,7 +88,9 @@ impl ProxyServer {
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             app_handle,
+            managed_auth,
             failover_manager,
+            model_capability: Arc::new(CachedModelCapabilityResolver::new()),
         };
 
         Self {
@@ -282,6 +299,9 @@ impl ProxyServer {
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))
+            .route("/models", get(handlers::handle_openai_models))
+            .route("/v1/models", get(handlers::handle_openai_models))
+            .route("/codex/v1/models", get(handlers::handle_openai_models))
             // Claude API (支持带前缀和不带前缀两种格式)
             .route("/v1/messages", post(handlers::handle_messages))
             .route("/claude/v1/messages", post(handlers::handle_messages))

@@ -19,6 +19,7 @@ pub mod http_client;
 pub mod hyper_client;
 pub(crate) mod json_canonical;
 pub mod log_codes;
+pub mod model_capability;
 pub mod model_mapper;
 pub mod provider_router;
 pub mod providers;
@@ -31,7 +32,7 @@ pub(crate) mod switch_lock;
 pub mod thinking_budget_rectifier;
 pub mod thinking_optimizer;
 pub mod thinking_rectifier;
-pub(crate) mod types;
+pub mod types;
 pub mod usage;
 
 // 公开导出给外部使用（commands, services等模块需要）

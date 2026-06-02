@@ -65,6 +65,8 @@ pub struct RequestContext {
     pub optimizer_config: OptimizerConfig,
     /// Copilot 优化器配置
     pub copilot_optimizer_config: CopilotOptimizerConfig,
+    /// 已过滤的请求体（从 ForwardResult 传递，用于 payload recording）
+    pub captured_request_body: Option<serde_json::Value>,
 }
 
 impl RequestContext {
@@ -87,6 +89,19 @@ impl RequestContext {
         app_type: AppType,
         tag: &'static str,
         app_type_str: &'static str,
+    ) -> Result<Self, ProxyError> {
+        Self::new_with_provider_override(state, body, headers, app_type, tag, app_type_str, None)
+            .await
+    }
+
+    pub async fn new_with_provider_override(
+        state: &ProxyState,
+        body: &serde_json::Value,
+        headers: &HeaderMap,
+        app_type: AppType,
+        tag: &'static str,
+        app_type_str: &'static str,
+        provider_override: Option<Vec<Provider>>,
     ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
 
@@ -126,17 +141,22 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
-            .provider_router
-            .select_providers(app_type_str)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
-                }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+        let providers = match provider_override {
+            Some(providers) => providers,
+            None => state
+                .provider_router
+                .select_providers(app_type_str)
+                .await
+                .map_err(|e| match e {
+                    crate::error::AppError::AllProvidersCircuitOpen => {
+                        ProxyError::AllProvidersCircuitOpen
+                    }
+                    crate::error::AppError::NoProvidersConfigured => {
+                        ProxyError::NoProvidersConfigured
+                    }
+                    _ => ProxyError::DatabaseError(e.to_string()),
+                })?,
+        };
 
         let provider = providers
             .first()
@@ -167,6 +187,7 @@ impl RequestContext {
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
+            captured_request_body: None,
         })
     }
 
@@ -190,27 +211,18 @@ impl RequestContext {
     /// 使用共享的 ProviderRouter，确保熔断器状态跨请求保持
     ///
     /// 配置生效规则：
-    /// - 故障转移开启：超时配置正常生效（0 表示禁用超时）
-    /// - 故障转移关闭：超时配置不生效（全部传入 0）
+    /// - 超时配置始终生效（0 表示禁用），独立于 auto_failover_enabled
+    /// - max_retries 仍然由 auto_failover_enabled 决定（关闭时强制 0）
     pub fn create_forwarder(&self, state: &ProxyState) -> RequestForwarder {
-        let (non_streaming_timeout, first_byte_timeout, idle_timeout) =
-            if self.app_config.auto_failover_enabled {
-                // 故障转移开启：使用配置的值（0 = 禁用超时）
-                (
-                    self.app_config.non_streaming_timeout as u64,
-                    self.app_config.streaming_first_byte_timeout as u64,
-                    self.app_config.streaming_idle_timeout as u64,
-                )
-            } else {
-                // 故障转移关闭：不启用超时配置
-                log::debug!(
-                    "[{}] Failover disabled, timeout configs are bypassed",
-                    self.tag
-                );
-                (0, 0, 0)
-            };
+        // 超时配置始终生效（0 表示禁用），独立于故障转移开关。
+        // 旧行为：故障转移关闭时强制清零超时，导致上游 SSE 挂死时客户端无限等待，
+        // 即使已配置 idle_timeout 也无法 fail-fast。fail-fast 的首要价值是让客户端
+        // 感知失败并由客户端层重试，与是否切换 provider 无关。
+        let non_streaming_timeout = self.app_config.non_streaming_timeout as u64;
+        let first_byte_timeout = self.app_config.streaming_first_byte_timeout as u64;
+        let idle_timeout = self.app_config.streaming_idle_timeout as u64;
 
-        // 故障转移关闭时强制 max_retries=0（仅尝试 1 个 provider），与「不超时 + 不切换」语义一致。
+        // 故障转移关闭时强制 max_retries=0（仅尝试 1 个 provider）。
         let max_retries = if self.app_config.auto_failover_enabled {
             self.app_config.max_retries
         } else {
@@ -225,6 +237,7 @@ impl RequestContext {
             state.gemini_shadow.clone(),
             state.failover_manager.clone(),
             state.app_handle.clone(),
+            state.managed_auth.clone(),
             self.current_provider_id.clone(),
             self.session_id.clone(),
             self.session_client_provided,
@@ -234,6 +247,7 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            Some(state.model_capability.clone()),
         )
     }
 
@@ -252,23 +266,13 @@ impl RequestContext {
 
     /// 获取流式超时配置
     ///
-    /// 配置生效规则：
-    /// - 故障转移开启：返回配置的值（0 表示禁用超时检查）
-    /// - 故障转移关闭：返回 0（禁用超时检查）
+    /// 配置始终生效（0 表示禁用），独立于 auto_failover_enabled。
+    /// 见 [`Self::create_forwarder`] 注释。
     #[inline]
     pub fn streaming_timeout_config(&self) -> StreamingTimeoutConfig {
-        if self.app_config.auto_failover_enabled {
-            // 故障转移开启：使用配置的值（0 = 禁用超时）
-            StreamingTimeoutConfig {
-                first_byte_timeout: self.app_config.streaming_first_byte_timeout as u64,
-                idle_timeout: self.app_config.streaming_idle_timeout as u64,
-            }
-        } else {
-            // 故障转移关闭：禁用流式超时检查
-            StreamingTimeoutConfig {
-                first_byte_timeout: 0,
-                idle_timeout: 0,
-            }
+        StreamingTimeoutConfig {
+            first_byte_timeout: self.app_config.streaming_first_byte_timeout as u64,
+            idle_timeout: self.app_config.streaming_idle_timeout as u64,
         }
     }
 }

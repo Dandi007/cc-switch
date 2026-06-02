@@ -6,12 +6,13 @@ mod claude_mcp;
 mod claude_plugin;
 mod codex_config;
 mod commands;
-mod config;
+pub mod config;
 mod database;
 mod deeplink;
 mod error;
 mod gemini_config;
 mod gemini_mcp;
+pub mod headless;
 pub mod hermes_config;
 mod init_status;
 mod lightweight;
@@ -48,13 +49,16 @@ pub use mcp::{
     sync_enabled_to_codex, sync_enabled_to_gemini, sync_single_server_to_claude,
     sync_single_server_to_codex, sync_single_server_to_gemini,
 };
+pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
+pub use proxy::types::ProxyConfig;
 pub use services::{
+    payload::PayloadService,
     skill::{migrate_skills_to_ssot, ImportSkillSelection},
-    ConfigService, EndpointLatency, McpService, PromptService, ProviderService, ProxyService,
-    SkillService, SpeedtestService,
+    ConfigService, EndpointLatency, LogFilters, McpService, PromptService, ProviderService,
+    ProxyService, SkillService, SpeedtestService,
 };
-pub use settings::{update_settings, AppSettings};
+pub use settings::{get_settings, update_settings, AppSettings};
 pub use store::AppState;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};

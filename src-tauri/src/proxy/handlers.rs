@@ -16,15 +16,15 @@ use super::{
     },
     handler_context::RequestContext,
     providers::{
-        get_adapter, get_claude_api_format, streaming::create_anthropic_sse_stream,
+        get_claude_api_format, streaming::create_anthropic_sse_stream,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, process_response, read_decoded_body,
-        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
-        usage_logging_enabled, SseUsageCollector,
+        aggregate_sse_events, create_logged_passthrough_stream, create_payload_collector,
+        process_response, read_decoded_body, strip_entity_headers_for_rebuilt_body,
+        strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
     sse::{strip_sse_field, take_sse_block},
@@ -126,11 +126,22 @@ async fn handle_messages_for_app(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
+    let registry_app_type = model_provider_registry_app_type(&app_type);
+    let provider_override =
+        route_provider_model_for_app(&state, &registry_app_type, &mut body).await?;
+    let mut ctx = RequestContext::new_with_provider_override(
+        &state,
+        &body,
+        &headers,
+        app_type.clone(),
+        tag,
+        app_type_str,
+        provider_override,
+    )
+    .await?;
 
     let raw_endpoint = uri
         .path_and_query()
@@ -171,6 +182,7 @@ async fn handle_messages_for_app(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let api_format = result
         .claude_api_format
         .as_deref()
@@ -178,9 +190,10 @@ async fn handle_messages_for_app(
         .to_string();
     let response = result.response;
 
-    // 检查是否需要格式转换（OpenRouter 等中转服务）
-    let adapter = get_adapter(&app_type);
-    let needs_transform = adapter.needs_transform(&ctx.provider);
+    // 检查是否需要格式转换：基于「按 model 解析后的」api_format（与请求侧 forwarder.rs
+    // 的 needs_transform 判定一致），而非 provider 基础格式。否则 per-model 把请求覆盖成
+    // anthropic 时，响应仍按 openai 转换 → openai_to_anthropic 报 "No choices in response"（422）。
+    let needs_transform = super::providers::claude_api_format_needs_transform(&api_format);
 
     // Claude 特有：格式转换处理
     if needs_transform {
@@ -292,49 +305,74 @@ async fn handle_claude_transform(
             Box::new(Box::pin(create_anthropic_sse_stream(stream)))
         };
 
-        // 创建使用量收集器；关闭 usage logging 时不要再解析转换后的 SSE。
-        let usage_collector = if usage_logging_enabled(state) {
+        // 创建使用量 + payload 收集器（合并到同一个回调，确保 request_id 一致）
+        let captured_request_body = ctx.captured_request_body.clone();
+        let usage_collector = {
             let state = state.clone();
             let provider_id = ctx.provider.id.clone();
             let model = ctx.request_model.clone();
             let status_code = status.as_u16();
             let start_time = ctx.start_time;
             let session_id = ctx.session_id.clone();
+            let logging_enabled = usage_logging_enabled(&state);
 
             Some(SseUsageCollector::new(
                 start_time,
-                Some(claude_stream_usage_event_filter),
+                None, // 收集所有 events（payload 需要完整内容）
                 move |events, first_token_ms| {
-                    if let Some(usage) = TokenUsage::from_claude_stream_events(&events) {
-                        let latency_ms = start_time.elapsed().as_millis() as u64;
-                        let state = state.clone();
-                        let provider_id = provider_id.clone();
-                        let model = model.clone();
-                        let session_id = session_id.clone();
+                    let usage = TokenUsage::from_claude_stream_events(&events);
+                    let request_id = usage
+                        .as_ref()
+                        .map(|u| u.dedup_request_id())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-                        tokio::spawn(async move {
-                            log_usage(
-                                &state,
-                                &provider_id,
-                                "claude",
-                                &model,
-                                &model,
-                                usage,
-                                latency_ms,
-                                first_token_ms,
-                                true,
-                                status_code,
-                                Some(session_id),
-                            )
-                            .await;
-                        });
-                    } else {
-                        log::debug!("[Claude] OpenRouter 流式响应缺少 usage 统计，跳过消费记录");
-                    }
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    let state = state.clone();
+                    let provider_id = provider_id.clone();
+                    let model = model.clone();
+                    let session_id = session_id.clone();
+                    let captured_body = captured_request_body.clone();
+                    let aggregated = aggregate_sse_events(&events);
+
+                    tokio::spawn(async move {
+                        // 记录 usage
+                        if logging_enabled {
+                            if let Some(usage) = usage {
+                                log_usage(
+                                    &state,
+                                    &provider_id,
+                                    "claude",
+                                    &model,
+                                    &model,
+                                    usage,
+                                    latency_ms,
+                                    first_token_ms,
+                                    true,
+                                    status_code,
+                                    Some(session_id),
+                                )
+                                .await;
+                            }
+                        }
+                        // 记录 payload（和 usage 共享 request_id）
+                        if let Some(req) = captured_body {
+                            use crate::proxy::usage::payload_logger::{PayloadLog, PayloadLogger};
+                            let logger = PayloadLogger::new(&state.db);
+                            let log = PayloadLog {
+                                request_id,
+                                request_body: req,
+                                response_body: Some(aggregated),
+                                request_headers: None,
+                                response_headers: None,
+                                created_at: chrono::Utc::now().timestamp(),
+                            };
+                            if let Err(e) = logger.log_payload(log) {
+                                log::warn!("payload 记录失败 (claude stream): {e}");
+                            }
+                        }
+                    });
                 },
             ))
-        } else {
-            None
         };
 
         // 获取流式超时配置
@@ -346,6 +384,7 @@ async fn handle_claude_transform(
             usage_collector,
             timeout_config,
             connection_guard,
+            None, // payload 已在 usage_collector 回调中处理
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -375,7 +414,10 @@ async fn handle_claude_transform(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     let upstream_response: Value = if aggregate_codex_oauth_responses_sse {
-        responses_sse_to_response_value(&body_str)?
+        responses_sse_to_response_value(&body_str).map_err(|e| {
+            log_forward_error(&state, &ctx, is_stream, &e);
+            e
+        })?
     } else {
         serde_json::from_slice(&body_bytes).map_err(|e| {
             log::error!("[Claude] 解析上游响应失败: {e}, body: {body_str}");
@@ -402,35 +444,75 @@ async fn handle_claude_transform(
         e
     })?;
 
-    // 记录使用量
-    if let Some(usage) = TokenUsage::from_claude_response(&anthropic_response) {
+    // 记录使用量 + payload（共享 request_id）
+    {
+        let usage = TokenUsage::from_claude_response(&anthropic_response);
+        let request_id = usage
+            .as_ref()
+            .map(|u| u.dedup_request_id())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let model = anthropic_response
             .get("model")
             .and_then(|m| m.as_str())
-            .unwrap_or("unknown");
+            .unwrap_or("unknown")
+            .to_string();
         let latency_ms = ctx.latency_ms();
-
         let request_model = ctx.request_model.clone();
+        let request_body = ctx.captured_request_body.clone();
+        let response_body = anthropic_response.clone();
+
         tokio::spawn({
             let state = state.clone();
             let provider_id = ctx.provider.id.clone();
-            let model = model.to_string();
             let session_id = ctx.session_id.clone();
+            let request_id = request_id.clone();
             async move {
-                log_usage(
-                    &state,
-                    &provider_id,
-                    "claude",
-                    &model,
-                    &request_model,
-                    usage,
-                    latency_ms,
-                    None,
-                    false,
-                    status.as_u16(),
-                    Some(session_id),
-                )
-                .await;
+                if let Some(usage) = usage {
+                    use super::usage::logger::UsageLogger;
+                    let logger = UsageLogger::new(&state.db);
+                    let (multiplier, pricing_model_source) =
+                        logger.resolve_pricing_config(&provider_id, "claude").await;
+                    let pricing_model = if pricing_model_source
+                        == crate::database::PRICING_SOURCE_REQUEST
+                    {
+                        request_model.clone()
+                    } else {
+                        model.clone()
+                    };
+                    if let Err(e) = logger.log_with_calculation(
+                        request_id.clone(),
+                        provider_id,
+                        "claude".to_string(),
+                        model,
+                        request_model,
+                        pricing_model,
+                        usage,
+                        multiplier,
+                        latency_ms,
+                        None,
+                        status.as_u16(),
+                        Some(session_id),
+                        None,
+                        false,
+                    ) {
+                        log::warn!("[Claude] usage 记录失败: {e}");
+                    }
+                }
+                if let Some(req) = request_body {
+                    use crate::proxy::usage::payload_logger::{PayloadLog, PayloadLogger};
+                    let logger = PayloadLogger::new(&state.db);
+                    let log = PayloadLog {
+                        request_id,
+                        request_body: req,
+                        response_body: Some(response_body),
+                        request_headers: None,
+                        response_headers: None,
+                        created_at: chrono::Utc::now().timestamp(),
+                    };
+                    if let Err(e) = logger.log_payload(log) {
+                        log::warn!("payload 记录失败 (claude transform): {e}");
+                    }
+                }
             }
         });
     }
@@ -469,6 +551,154 @@ fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
 // Codex API 处理器
 // ============================================================================
 
+fn model_family_provider_id(family: &str) -> &str {
+    match family {
+        "openai" => "gpt",
+        other => other,
+    }
+}
+
+fn model_provider_registry_app_type(app_type: &AppType) -> AppType {
+    match app_type {
+        AppType::Claude => AppType::Codex,
+        _ => app_type.clone(),
+    }
+}
+
+async fn route_provider_model_for_app(
+    state: &ProxyState,
+    app_type: &AppType,
+    body: &mut Value,
+) -> Result<Option<Vec<crate::provider::Provider>>, ProxyError> {
+    let Some(model) = body.get("model").and_then(|m| m.as_str()) else {
+        return Ok(None);
+    };
+    let Some((family, upstream_model)) = model.split_once('/') else {
+        return Ok(None);
+    };
+    if family.is_empty() || upstream_model.is_empty() {
+        return Ok(None);
+    }
+
+    let provider_id = model_family_provider_id(family);
+    let Some(provider) = state
+        .db
+        .get_provider_by_id(provider_id, app_type.as_str())
+        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?
+    else {
+        log::debug!(
+            "[route] unknown model prefix family={family}, falling through to default provider"
+        );
+        return Ok(None);
+    };
+
+    body["model"] = Value::String(upstream_model.to_string());
+    Ok(Some(vec![provider]))
+}
+
+
+pub(crate) fn normalize_codex_oauth_responses_body(body: &mut Value) {
+    const REASONING_MARKER: &str = "reasoning.encrypted_content";
+    if !body.is_object() {
+        return;
+    }
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("store".to_string(), json!(false));
+        obj.remove("max_output_tokens");
+        obj.remove("temperature");
+        obj.remove("top_p");
+        obj.entry("instructions".to_string()).or_insert(json!(""));
+        obj.entry("tools".to_string()).or_insert(json!([]));
+        obj.entry("parallel_tool_calls".to_string())
+            .or_insert(json!(false));
+
+        // Upstream codex_oauth always responds with SSE regardless of what
+        // the client requested. The is_stream flag (captured before this
+        // normalize) controls whether process_response aggregates SSE into
+        // JSON for non-streaming clients.
+        obj.insert("stream".to_string(), json!(true));
+
+        if let Some(input) = obj.get_mut("input") {
+            if let Some(text) = input.as_str() {
+                *input = json!([{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": text,
+                    }],
+                }]);
+            }
+        }
+
+        let include = obj.entry("include".to_string()).or_insert(json!([]));
+        if !include.is_array() {
+            *include = json!([]);
+        }
+        if let Some(items) = include.as_array_mut() {
+            if !items
+                .iter()
+                .any(|value| value.as_str() == Some(REASONING_MARKER))
+            {
+                items.push(json!(REASONING_MARKER));
+            }
+        }
+    }
+}
+
+pub async fn handle_openai_models(
+    State(state): State<ProxyState>,
+) -> Result<Json<Value>, ProxyError> {
+    let providers = state
+        .db
+        .get_all_providers(AppType::Codex.as_str())
+        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+
+    let mut data = Vec::new();
+    for provider in providers.values() {
+        let family = provider
+            .settings_config
+            .get("modelFamily")
+            .and_then(|v| v.as_str())
+            .unwrap_or(provider.id.as_str());
+        let Some(models) = provider
+            .settings_config
+            .get("models")
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+
+        for model in models {
+            let model_id = match model {
+                Value::String(id) => id.as_str(),
+                Value::Object(obj) => obj.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                _ => "",
+            };
+            if model_id.is_empty() {
+                continue;
+            }
+            data.push(json!({
+                "id": format!("{family}/{model_id}"),
+                "object": "model",
+                "created": 0,
+                "owned_by": family,
+            }));
+        }
+    }
+
+    data.sort_by(|a, b| {
+        a.get("id")
+            .and_then(|v| v.as_str())
+            .cmp(&b.get("id").and_then(|v| v.as_str()))
+    });
+
+    Ok(Json(json!({
+        "object": "list",
+        "data": data,
+    })))
+}
+
 /// 处理 /v1/chat/completions 请求（OpenAI Chat Completions API - Codex CLI）
 pub async fn handle_chat_completions(
     State(state): State<ProxyState>,
@@ -484,11 +714,21 @@ pub async fn handle_chat_completions(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+    let provider_override =
+        route_provider_model_for_app(&state, &AppType::Codex, &mut body).await?;
+    let mut ctx = RequestContext::new_with_provider_override(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        provider_override,
+    )
+    .await?;
     let endpoint = endpoint_with_query(&uri, "/chat/completions");
 
     let is_stream = body
@@ -521,6 +761,7 @@ pub async fn handle_chat_completions(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let response = result.response;
 
     process_response(
@@ -548,17 +789,41 @@ pub async fn handle_responses(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
-    let endpoint = endpoint_with_query(&uri, "/responses");
-
-    let is_stream = body
+    // Capture client stream intent BEFORE normalize mutates the body.
+    let client_wants_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(false); // OpenAI Responses default is non-streaming
+
+    let provider_override =
+        route_provider_model_for_app(&state, &AppType::Codex, &mut body).await?;
+
+    let mut ctx = RequestContext::new_with_provider_override(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        provider_override,
+    )
+    .await?;
+
+    // Use the resolved provider (not just provider_override) to decide
+    // whether to normalize. This covers the case where the current/default
+    // provider is codex_oauth but the model has no prefix slug → route
+    // returns None, yet the downstream backend is still the ChatGPT OAuth
+    // endpoint and needs the normalized request shape.
+    if ctx.provider.is_codex_oauth() {
+        normalize_codex_oauth_responses_body(&mut body);
+    }
+
+    let endpoint = endpoint_with_query(&uri, "/responses");
+
+    let is_stream = client_wants_stream;
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
@@ -585,6 +850,7 @@ pub async fn handle_responses(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let response = result.response;
 
     process_response(
@@ -612,11 +878,21 @@ pub async fn handle_responses_compact(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+    let provider_override =
+        route_provider_model_for_app(&state, &AppType::Codex, &mut body).await?;
+    let mut ctx = RequestContext::new_with_provider_override(
+        &state,
+        &body,
+        &headers,
+        AppType::Codex,
+        "Codex",
+        "codex",
+        provider_override,
+    )
+    .await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
     let is_stream = body
@@ -649,6 +925,7 @@ pub async fn handle_responses_compact(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let response = result.response;
 
     process_response(
@@ -730,6 +1007,7 @@ pub async fn handle_gemini(
 
     let connection_guard = result.connection_guard.take();
     ctx.provider = result.provider;
+    ctx.captured_request_body = result.captured_request_body.take();
     let response = result.response;
 
     process_response(
@@ -756,6 +1034,33 @@ fn should_use_claude_transform_streaming(
 ///
 /// 复用 `proxy::sse` 的 `take_sse_block`/`strip_sse_field`：`take_sse_block` 同时支持
 /// `\n\n` 与 `\r\n\r\n` 两种分隔符，`strip_sse_field` 兼容带/不带空格的字段写法。
+/// 识别上游"context window 超限"类错误。
+///
+/// Why: Claude Code 客户端按 `claude-opus-4-7` 的窗口（~1M）预估上下文，
+/// 但路由到 `gpt/gpt-5.5` 的 ChatGPT Codex backend 实际窗口远小于此。
+/// 命中后改返回 400 invalid_request_error，让客户端识别为请求级问题
+/// 而非"代理转换错误"（422），便于触发 /compact 或人工裁剪后重试。
+fn is_context_window_exceeded_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "exceeds the context window",
+        "exceeds the model's context",
+        "exceed the context window",
+        "exceed the model's context",
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context length",
+        "context window of this model",
+        "input is too long",
+        "request too large",
+        "prompt is too long",
+        "tokens exceeds",
+        "上下文窗口",
+        "上下文长度",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
 fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
     let mut buffer = body.to_string();
     let mut completed_response: Option<Value> = None;
@@ -800,6 +1105,9 @@ fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
                     .pointer("/response/error/message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("response.failed event received");
+                if is_context_window_exceeded_message(message) {
+                    return Err(ProxyError::InvalidRequest(message.to_string()));
+                }
                 return Err(ProxyError::TransformError(message.to_string()));
             }
             _ => {}
@@ -911,7 +1219,10 @@ async fn log_usage(
 
 #[cfg(test)]
 mod tests {
-    use super::{responses_sse_to_response_value, should_use_claude_transform_streaming};
+    use super::{
+        is_context_window_exceeded_message, responses_sse_to_response_value,
+        should_use_claude_transform_streaming,
+    };
     use crate::proxy::ProxyError;
 
     #[test]
@@ -992,10 +1303,124 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
     }
 
     #[test]
+    fn context_window_marker_detection_positive_cases() {
+        let cases = [
+            "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            "This model's maximum context length is 400000 tokens.",
+            "context_length_exceeded: please reduce the input.",
+            "Request too large for model gpt-5.5",
+            "The prompt is too long for this model",
+            "请求 token 数已超过模型上下文窗口限制",
+        ];
+        for msg in cases {
+            assert!(
+                is_context_window_exceeded_message(msg),
+                "should match context-window marker: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_window_marker_detection_negative_cases() {
+        let cases = [
+            "upstream blew up",
+            "Internal server error",
+            "Refresh Token 失效或已过期",
+            "rate limit reached",
+            "model not found",
+        ];
+        for msg in cases {
+            assert!(
+                !is_context_window_exceeded_message(msg),
+                "should not match context-window marker: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_sse_response_failed_with_context_window_maps_to_invalid_request() {
+        let sse = "event: response.failed\n\
+data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"Your input exceeds the context window of this model. Please adjust your input and try again.\"}}}\n\n";
+
+        let err = responses_sse_to_response_value(sse).unwrap_err();
+        match err {
+            ProxyError::InvalidRequest(msg) => {
+                assert!(msg.contains("context window"), "unexpected message: {msg}")
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn responses_sse_to_response_value_errors_when_no_completed_event() {
         let sse = "event: response.output_item.done\n\
 data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n\n";
 
         assert!(responses_sse_to_response_value(sse).is_err());
+    }
+
+    // ===================================================================
+    // normalize_codex_oauth_responses_body unit tests
+    // ===================================================================
+
+    #[test]
+    fn normalize_stream_false_stays_true() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": false,
+        });
+        super::normalize_codex_oauth_responses_body(&mut body);
+        // Upstream always SSE; body must carry stream:true for ChatGPT backend.
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["store"], serde_json::json!(false));
+        assert!(body["include"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("reasoning.encrypted_content")));
+    }
+
+    #[test]
+    fn normalize_stream_omit_defaults_true() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+        });
+        super::normalize_codex_oauth_responses_body(&mut body);
+        assert_eq!(body["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn normalize_stream_true_preserves() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "stream": true,
+        });
+        super::normalize_codex_oauth_responses_body(&mut body);
+        assert_eq!(body["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn normalize_wraps_string_input() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "plain text input",
+        });
+        super::normalize_codex_oauth_responses_body(&mut body);
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "plain text input"}],
+            }])
+        );
+    }
+
+    #[test]
+    fn normalize_skips_non_object() {
+        let mut body = serde_json::json!("not an object");
+        super::normalize_codex_oauth_responses_body(&mut body);
+        assert_eq!(body, serde_json::json!("not an object"));
     }
 }

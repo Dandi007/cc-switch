@@ -6,6 +6,23 @@ use axum::{
 use serde_json::json;
 use thiserror::Error;
 
+pub fn is_transient_overload_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("server_is_overloaded")
+        || lower.contains("service_unavailable_error")
+        || lower.contains("overloaded_error")
+        || lower.contains("currently overloaded")
+}
+
+/// OpenAI Responses API 在 response.failed 里发回的通用可重试错误。
+/// 该错误的 HTTP 外壳是 200，cc-switch 将 body 中的 response.failed 转换为
+/// TransformError，需要告知 Claude Code 可以重试（返回 529）。
+pub fn is_openai_retryable_error_message(message: &str) -> bool {
+    message.contains("An error occurred while processing your request")
+        || message.contains("You can retry your request")
+        || message.contains("help.openai.com")
+}
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("服务器已在运行")]
@@ -55,7 +72,6 @@ pub enum ProxyError {
     #[error("格式转换错误: {0}")]
     TransformError(String),
 
-    #[allow(dead_code)]
     #[error("无效的请求: {0}")]
     InvalidRequest(String),
 
@@ -144,8 +160,14 @@ impl IntoResponse for ProxyError {
                         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
                     }
                     ProxyError::ConfigError(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-                    ProxyError::TransformError(_) => {
-                        (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
+                    ProxyError::TransformError(message) => {
+                        if is_transient_overload_message(message)
+                            || is_openai_retryable_error_message(message)
+                        {
+                            (StatusCode::from_u16(529).unwrap(), self.to_string())
+                        } else {
+                            (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
+                        }
                     }
                     ProxyError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
                     ProxyError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
@@ -159,10 +181,19 @@ impl IntoResponse for ProxyError {
                     ProxyError::UpstreamError { .. } => unreachable!(),
                 };
 
+                let error_type = match &self {
+                    ProxyError::TransformError(message)
+                        if is_transient_overload_message(message)
+                            || is_openai_retryable_error_message(message) =>
+                    {
+                        "overloaded_error"
+                    }
+                    _ => "proxy_error",
+                };
                 let error_body = json!({
                     "error": {
                         "message": message,
-                        "type": "proxy_error",
+                        "type": error_type,
                     }
                 });
 

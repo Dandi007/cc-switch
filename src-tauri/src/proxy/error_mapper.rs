@@ -2,7 +2,7 @@
 //!
 //! 将 ProxyError 映射到合适的 HTTP 状态码，用于日志记录
 
-use super::ProxyError;
+use super::{error::is_transient_overload_message, ProxyError};
 
 /// 将 ProxyError 映射到 HTTP 状态码
 ///
@@ -43,7 +43,11 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         ProxyError::DatabaseError(_) => 500,
 
         // 转换错误：500 Internal Server Error
+        ProxyError::TransformError(message) if is_transient_overload_message(message) => 529,
         ProxyError::TransformError(_) => 500,
+
+        // 无效请求：400 Bad Request（与 IntoResponse 保持一致）
+        ProxyError::InvalidRequest(_) => 400,
 
         // 其他未知错误：500 Internal Server Error
         _ => 500,
@@ -102,6 +106,12 @@ mod tests {
     fn test_map_no_provider_error() {
         let error = ProxyError::NoAvailableProvider;
         assert_eq!(map_proxy_error_to_status(&error), 503);
+    }
+
+    #[test]
+    fn test_map_invalid_request_error() {
+        let error = ProxyError::InvalidRequest("input too large".to_string());
+        assert_eq!(map_proxy_error_to_status(&error), 400);
     }
 
     #[test]

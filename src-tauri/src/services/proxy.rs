@@ -6,7 +6,7 @@ use crate::app_config::AppType;
 use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
 use crate::database::Database;
 use crate::provider::Provider;
-use crate::proxy::server::ProxyServer;
+use crate::proxy::server::{ManagedAuthRegistry, ProxyServer};
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
 use crate::services::provider::{
@@ -51,6 +51,8 @@ pub struct ProxyService {
     server: Arc<RwLock<Option<ProxyServer>>>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
     app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
+    /// Headless 场景注入的托管认证 manager。
+    managed_auth: Arc<RwLock<ManagedAuthRegistry>>,
     switch_locks: SwitchLockManager,
 }
 
@@ -65,6 +67,7 @@ impl ProxyService {
             db,
             server: Arc::new(RwLock::new(None)),
             app_handle: Arc::new(RwLock::new(None)),
+            managed_auth: Arc::new(RwLock::new(ManagedAuthRegistry::default())),
             switch_locks: SwitchLockManager::new(),
         }
     }
@@ -240,6 +243,13 @@ impl ProxyService {
         });
     }
 
+    /// 设置 Headless proxy 可用的托管认证依赖。
+    pub fn set_managed_auth_registry(&self, registry: ManagedAuthRegistry) {
+        futures::executor::block_on(async {
+            *self.managed_auth.write().await = registry;
+        });
+    }
+
     /// 启动代理服务器
     pub async fn start(&self) -> Result<ProxyServerInfo, String> {
         // 1. 启动时自动设置 proxy_enabled = true
@@ -277,7 +287,8 @@ impl ProxyService {
 
         // 4. 创建并启动服务器
         let app_handle = self.app_handle.read().await.clone();
-        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle);
+        let managed_auth = self.managed_auth.read().await.clone();
+        let server = ProxyServer::new(config.clone(), self.db.clone(), app_handle, managed_auth);
         let info = server
             .start()
             .await
@@ -1928,7 +1939,9 @@ impl ProxyService {
             }
 
             let app_handle = self.app_handle.read().await.clone();
-            let new_server = ProxyServer::new(new_config, self.db.clone(), app_handle);
+            let managed_auth = self.managed_auth.read().await.clone();
+            let new_server =
+                ProxyServer::new(new_config, self.db.clone(), app_handle, managed_auth);
             new_server
                 .start()
                 .await
