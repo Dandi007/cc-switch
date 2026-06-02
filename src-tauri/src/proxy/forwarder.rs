@@ -34,6 +34,16 @@ use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
 
+/// 上游瞬时 429（Too Many Requests / limit_burst_rate）的「同 provider 退避重试」上限。
+/// 与跨 provider 故障转移（max_attempts）正交：先在同一家退避几次吸收突发限流，
+/// 仍失败才落回 UpstreamError 交由外层故障转移。
+const BURST_RATE_MAX_RETRIES: u32 = 4;
+
+/// 429 退避延迟（毫秒），指数增长并封顶：500 / 1000 / 2000 / 4000 / 8000。
+fn burst_rate_backoff_ms(attempt: u32) -> u64 {
+    500u64.saturating_mul(1u64 << attempt.min(4))
+}
+
 pub struct ForwardResult {
     pub response: ProxyResponse,
     pub provider: Provider,
@@ -1620,79 +1630,112 @@ impl RequestForwarder {
             is_copilot,
         );
 
-        // 发送请求
-        let response = if is_socks_proxy || !preserve_exact_header_case {
-            // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
-            // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
-            log::debug!(
-                "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
-            );
-            let client = super::http_client::get();
-            let mut request = client.request(method.clone(), &url);
-            if request_is_streaming {
-                // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
-                // 的首包/静默期超时控制，避免长流被总时长误杀。
-                request = request.timeout(std::time::Duration::from_secs(24 * 60 * 60));
-            } else if !self.non_streaming_timeout.is_zero() {
-                request = request.timeout(self.non_streaming_timeout);
-            }
-            for (key, value) in &ordered_headers {
-                request = request.header(key, value);
-            }
-            let send = request.body(body_bytes).send();
-            let send_result = if request_is_streaming {
-                let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
-                    timeout
+        // 发送请求（对上游瞬时 429 限流做「同 provider 退避重试」）
+        //
+        // lingzhi 等聚合网关在高并发 / 大请求密集打来时会返回 429 limit_burst_rate
+        // （"Request rate increased too quickly"），这是可恢复的瞬时限流而非硬配额。
+        // OpenClaw 这类 agent 的多步工具循环每步都是大 prompt、短时间密集发起，最易触发。
+        // 关键安全前提：429 永远走非成功分支、body 已被完整读出、流式 body 尚未开始
+        // 转发给客户端，因此在这里退避后重发同一请求是安全的（不会出现半截流）。
+        let mut burst_attempt: u32 = 0;
+        loop {
+            // 每次尝试都从主副本克隆，因为 send 会消费 body_bytes / ordered_headers。
+            let body_bytes = body_bytes.clone();
+            let ordered_headers = ordered_headers.clone();
+
+            let response = if is_socks_proxy || !preserve_exact_header_case {
+                // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
+                // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
+                log::debug!(
+                    "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
+                );
+                let client = super::http_client::get();
+                let mut request = client.request(method.clone(), &url);
+                if request_is_streaming {
+                    // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
+                    // 的首包/静默期超时控制，避免长流被总时长误杀。
+                    request = request.timeout(std::time::Duration::from_secs(24 * 60 * 60));
+                } else if !self.non_streaming_timeout.is_zero() {
+                    request = request.timeout(self.non_streaming_timeout);
+                }
+                for (key, value) in &ordered_headers {
+                    request = request.header(key, value);
+                }
+                let send = request.body(body_bytes).send();
+                let send_result = if request_is_streaming {
+                    let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
+                        timeout
+                    } else {
+                        self.streaming_first_byte_timeout
+                    };
+                    tokio::time::timeout(header_timeout, send)
+                        .await
+                        .map_err(|_| {
+                            ProxyError::Timeout(format!(
+                                "流式响应首包超时: {}s（上游未返回响应头）",
+                                header_timeout.as_secs()
+                            ))
+                        })?
                 } else {
-                    self.streaming_first_byte_timeout
+                    send.await
                 };
-                tokio::time::timeout(header_timeout, send)
-                    .await
-                    .map_err(|_| {
-                        ProxyError::Timeout(format!(
-                            "流式响应首包超时: {}s（上游未返回响应头）",
-                            header_timeout.as_secs()
-                        ))
-                    })?
+                let reqwest_resp = send_result.map_err(map_reqwest_send_error)?;
+                ProxyResponse::Reqwest(reqwest_resp)
             } else {
-                send.await
+                // HTTP 代理或直连：走 hyper raw write（保持 header 大小写）
+                // 如果有 HTTP 代理，hyper_client 会用 CONNECT 隧道穿过代理
+                let uri: http::Uri = url
+                    .parse()
+                    .map_err(|e| ProxyError::ForwardFailed(format!("Invalid URL '{url}': {e}")))?;
+                super::hyper_client::send_request(
+                    uri,
+                    method.clone(),
+                    ordered_headers,
+                    extensions.clone(),
+                    body_bytes,
+                    timeout,
+                    upstream_proxy_url.as_deref(),
+                )
+                .await?
             };
-            let reqwest_resp = send_result.map_err(map_reqwest_send_error)?;
-            ProxyResponse::Reqwest(reqwest_resp)
-        } else {
-            // HTTP 代理或直连：走 hyper raw write（保持 header 大小写）
-            // 如果有 HTTP 代理，hyper_client 会用 CONNECT 隧道穿过代理
-            let uri: http::Uri = url
-                .parse()
-                .map_err(|e| ProxyError::ForwardFailed(format!("Invalid URL '{url}': {e}")))?;
-            super::hyper_client::send_request(
-                uri,
-                method.clone(),
-                ordered_headers,
-                extensions.clone(),
-                body_bytes,
-                timeout,
-                upstream_proxy_url.as_deref(),
-            )
-            .await?
-        };
 
-        // 检查响应状态
-        let status = response.status();
+            // 检查响应状态
+            let status = response.status();
 
-        if status.is_success() {
-            let response = self
-                .prepare_success_response_for_failover(response, request_is_streaming)
-                .await?;
-            Ok((response, resolved_claude_api_format, Some(captured_body)))
-        } else {
+            if status.is_success() {
+                let response = self
+                    .prepare_success_response_for_failover(response, request_is_streaming)
+                    .await?;
+                return Ok((response, resolved_claude_api_format, Some(captured_body)));
+            }
+
             let status_code = status.as_u16();
             let body_text = String::from_utf8(response.bytes().await?.to_vec()).ok();
 
-            Err(ProxyError::UpstreamError {
+            // 瞬时 429 限流：退避后重试同一家，避免把可恢复的 burst-rate 直接抛给客户端。
+            // 退避耗尽后才落回 UpstreamError，交由外层 max_attempts 故障转移处理。
+            if status_code == 429 && burst_attempt < BURST_RATE_MAX_RETRIES {
+                let delay_ms = burst_rate_backoff_ms(burst_attempt);
+                log::warn!(
+                    "[{tag}] 上游 429 限流，{delay_ms}ms 后退避重试（第 {}/{} 次）: {}",
+                    burst_attempt + 1,
+                    BURST_RATE_MAX_RETRIES,
+                    body_text
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(120)
+                        .collect::<String>()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                burst_attempt += 1;
+                continue;
+            }
+
+            return Err(ProxyError::UpstreamError {
                 status: status_code,
                 body: body_text,
-            })
+            });
         }
     }
 
