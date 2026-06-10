@@ -81,6 +81,15 @@ impl Database {
             .map_err(|e| AppError::Database(format!("SQL dump 包含无效 UTF-8: {e}")))
     }
 
+    /// Export sync SQL directly to a writer (streaming, zero copy-into-Vec).
+    ///
+    /// Skips the same `SYNC_SKIP_TABLES` as [`export_sql_string_for_sync`].
+    /// The byte format is identical — this is the F1-B streaming path.
+    pub fn export_sql_to_writer_for_sync<W: Write>(&self, w: &mut W) -> Result<(), AppError> {
+        let snapshot = self.snapshot_to_file()?;
+        Self::dump_sql_to_writer(snapshot.conn(), SYNC_SKIP_TABLES, w)
+    }
+
     /// 导出为 SQLite 兼容的 SQL 文本，流式写入目标文件（原子替换）。
     ///
     /// 全程无 O(DB 大小) 内存分配：快照写临时文件，dump 直接流式写入，
@@ -1160,6 +1169,95 @@ mod tests {
             Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
             None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
         }
+
+        Ok(())
+    }
+
+    // ── F1-B: 流式 sync 导出测试 ───────────────────────────────────────────
+
+    /// export_sql_to_writer_for_sync 的字节输出与 export_sql_string_for_sync 完全相同
+    /// （时间戳行除外），证明 wire format 兼容性不变。
+    #[test]
+    fn export_sql_to_writer_for_sync_matches_string_variant() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-f1b', 'claude', 'F1B Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+
+        // string variant (old path)
+        let string_dump = db.export_sql_string_for_sync()?;
+
+        // writer variant (new streaming path)
+        let mut buf: Vec<u8> = Vec::new();
+        db.export_sql_to_writer_for_sync(&mut buf)?;
+        let writer_dump = String::from_utf8(buf).expect("writer dump should be valid UTF-8");
+
+        // Strip timestamp line before comparing — timestamps differ between calls.
+        let strip_ts = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.starts_with("-- 生成时间:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert_eq!(
+            strip_ts(&string_dump),
+            strip_ts(&writer_dump),
+            "streaming writer variant must produce identical content to string variant"
+        );
+        Ok(())
+    }
+
+    /// export_sql_to_writer_for_sync skips SYNC_SKIP_TABLES データ行 but writes their schema.
+    #[test]
+    fn export_sql_to_writer_for_sync_skips_skip_tables() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-f1b2', 'claude', 'F1B2 Provider', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at
+                ) VALUES ('req-f1b', 'p-f1b2', 'claude', 'claude-3', 1, 1, '0.0', 10, 200, 1)",
+                [],
+            )?;
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        db.export_sql_to_writer_for_sync(&mut buf)?;
+        let dump = String::from_utf8(buf).expect("valid UTF-8");
+
+        assert!(
+            !dump.contains("req-f1b"),
+            "streaming sync dump must not contain proxy_request_logs rows"
+        );
+        assert!(
+            dump.starts_with(CC_SWITCH_SQL_EXPORT_HEADER),
+            "streaming sync dump must start with CC Switch export header"
+        );
+
+        // Confirm the output is importable
+        let dst = Database::memory()?;
+        dst.import_sql_string(&dump)?;
+        let count: i64 = {
+            let conn = crate::database::lock_conn!(dst.conn);
+            conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |r| r.get(0))?
+        };
+        assert_eq!(
+            count, 0,
+            "imported streaming sync dump should have 0 log rows"
+        );
 
         Ok(())
     }

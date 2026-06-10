@@ -247,6 +247,47 @@ pub async fn put_bytes(
     Err(webdav_status_error("PUT", resp.status(), url))
 }
 
+/// PUT a file to a remote WebDAV URL via a streaming body.
+///
+/// The file is read in chunks — the full content is never buffered in memory.
+/// An explicit `Content-Length` header is set from the known `content_length`
+/// so that WebDAV servers that reject chunked transfer encoding work correctly.
+pub async fn put_file(
+    url: &str,
+    auth: &WebDavAuth,
+    path: &std::path::Path,
+    content_length: u64,
+    content_type: &str,
+) -> Result<(), AppError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| AppError::IoContext {
+            context: format!("打开上传临时文件失败: {}", path.display()),
+            source: e,
+        })?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = reqwest::Body::wrap_stream(stream);
+
+    let client = http_client::get();
+    let resp = apply_auth(
+        client
+            .put(url)
+            .header("Content-Type", content_type)
+            .header("Content-Length", content_length.to_string())
+            .body(body)
+            .timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECS)),
+        auth,
+    )
+    .send()
+    .await
+    .map_err(|e| webdav_transport_error("webdav.put_failed", "PUT 请求", "PUT request", url, &e))?;
+
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    Err(webdav_status_error("PUT", resp.status(), url))
+}
+
 /// GET bytes from a remote WebDAV URL. Returns `None` on 404.
 ///
 /// On success returns `(body_bytes, optional_etag)`.
