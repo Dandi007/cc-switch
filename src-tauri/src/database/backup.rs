@@ -16,10 +16,11 @@ use tempfile::NamedTempFile;
 
 /// 临时文件快照：持有快照文件和对应的 SQLite 连接。
 ///
-/// `_temp` 保持临时文件存活，`conn` 从该文件读取。两者必须同时释放。
+/// `conn` 先于 `_temp` 声明，确保 drop 顺序为先关闭 SQLite 句柄，再删除临时文件。
+/// 在 Windows 上 SQLite 持有独占锁，若反序 drop 会导致 NamedTempFile::drop 静默失败，临时文件泄漏。
 pub(crate) struct DbSnapshot {
-    _temp: NamedTempFile,
     conn: Connection,
+    _temp: NamedTempFile,
 }
 
 impl DbSnapshot {
@@ -83,49 +84,44 @@ impl Database {
     /// 导出为 SQLite 兼容的 SQL 文本，流式写入目标文件（原子替换）。
     ///
     /// 全程无 O(DB 大小) 内存分配：快照写临时文件，dump 直接流式写入，
-    /// 最后 rename 原子替换目标路径。
+    /// 最后 persist 原子替换目标路径。临时文件由 NamedTempFile RAII 管理，
+    /// 任何错误路径均自动清理，不泄漏 .tmp 文件。
     pub fn export_sql(&self, target_path: &Path) -> Result<(), AppError> {
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
-        }
-
         let parent = target_path
             .parent()
             .ok_or_else(|| AppError::Config("无效的导出路径".to_string()))?;
 
-        // 在目标目录创建临时文件，保证 rename 是同一挂载点内的原子操作
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let file_name = target_path
-            .file_name()
-            .ok_or_else(|| AppError::Config("无效的文件名".to_string()))?
-            .to_string_lossy();
-        let tmp_path = parent.join(format!("{file_name}.tmp.{ts}"));
+        fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
+
+        // 在目标目录创建临时文件，保证 persist 是同一挂载点内的原子操作；
+        // NamedTempFile 在任何提前返回时自动删除临时文件。
+        let mut tmp = NamedTempFile::new_in(parent).map_err(|e| AppError::IoContext {
+            context: "创建导出临时文件失败".to_string(),
+            source: e,
+        })?;
+        // 提前捕获路径，避免 flush 错误闭包与可变借用冲突。
+        let tmp_path_for_err = tmp.path().to_path_buf();
 
         {
-            let f = fs::File::create(&tmp_path).map_err(|e| AppError::io(&tmp_path, e))?;
-            let mut writer = BufWriter::new(f);
+            let mut writer = BufWriter::new(tmp.as_file_mut());
             let snapshot = self.snapshot_to_file()?;
             Self::dump_sql_to_writer(snapshot.conn(), &[], &mut writer)?;
-            writer.flush().map_err(|e| AppError::io(&tmp_path, e))?;
+            writer
+                .flush()
+                .map_err(|e| AppError::io(&tmp_path_for_err, e))?;
         }
 
         #[cfg(windows)]
-        {
-            if target_path.exists() {
-                let _ = fs::remove_file(target_path);
-            }
+        if target_path.exists() {
+            fs::remove_file(target_path).map_err(|e| AppError::IoContext {
+                context: format!("覆盖前删除目标文件失败: {}", target_path.display()),
+                source: e,
+            })?;
         }
 
-        fs::rename(&tmp_path, target_path).map_err(|e| AppError::IoContext {
-            context: format!(
-                "原子替换失败: {} -> {}",
-                tmp_path.display(),
-                target_path.display()
-            ),
-            source: e,
+        tmp.persist(target_path).map_err(|e| AppError::IoContext {
+            context: format!("原子替换导出文件失败: {}", target_path.display()),
+            source: e.error,
         })?;
 
         Ok(())
@@ -474,7 +470,7 @@ impl Database {
         let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
-            .unwrap_or(0);
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         write!(
             w,
@@ -549,8 +545,12 @@ impl Database {
                     values.push(Self::format_sql_value(value)?);
                 }
 
-                writeln!(w, "INSERT INTO \"{table}\" ({cols}) VALUES ({});", values.join(", "))
-                    .map_err(map_io)?;
+                writeln!(
+                    w,
+                    "INSERT INTO \"{table}\" ({cols}) VALUES ({});",
+                    values.join(", ")
+                )
+                .map_err(map_io)?;
             }
         }
 
@@ -830,6 +830,65 @@ mod tests {
         Ok(())
     }
 
+    /// 原子覆盖合约：对同一路径二次导出时，目标文件内容以第二次导出的数据为准。
+    /// 验证 export_sql 的 persist 路径在目标已存在时能正确替换。
+    #[test]
+    fn export_sql_overwrites_existing_file() -> Result<(), AppError> {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let export_path = tmp_dir.path().join("overwrite_test.sql");
+
+        // 第一次导出：只有 provider p-ow1
+        let db1 = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db1.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-ow1', 'claude', 'OW Provider 1', '{}', '{}')",
+                [],
+            )?;
+        }
+        db1.export_sql(&export_path)?;
+        assert!(
+            export_path.exists(),
+            "export file should exist after first export"
+        );
+
+        // 第二次导出：有 provider p-ow1 和 p-ow2 两行
+        let db2 = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db2.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-ow1', 'claude', 'OW Provider 1', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-ow2', 'claude', 'OW Provider 2', '{}', '{}')",
+                [],
+            )?;
+        }
+        db2.export_sql(&export_path)?;
+
+        // 导入覆盖后的文件，验证行数为 2（第二次导出的内容）
+        let dst = Database::memory()?;
+        dst.import_sql(&export_path)?;
+        let provider_count: i64 = {
+            let conn = crate::database::lock_conn!(dst.conn);
+            conn.query_row(
+                "SELECT COUNT(*) FROM providers WHERE id IN ('p-ow1','p-ow2')",
+                [],
+                |r| r.get(0),
+            )?
+        };
+        assert_eq!(
+            provider_count, 2,
+            "导出文件应被第二次导出原子覆盖，包含 2 行 provider"
+        );
+
+        Ok(())
+    }
+
     /// dump 幂等性：同一 DB 两次导出字节相同（时间戳外的结构体积稳定）
     /// 严格验证：输出以 CC_SWITCH_SQL_EXPORT_HEADER 开头，且通过 validate 函数
     #[test]
@@ -851,16 +910,16 @@ mod tests {
             &dump[..dump.len().min(80)]
         );
 
-        // validate_cc_switch_sql_export は pub(crate) ではないが import_sql_string 経由で検証
-        // 直接呼べないので、import_sql_string が Ok を返すことでヘッダ検証を確認する
+        // validate_cc_switch_sql_export 非 pub(crate)，通过 import_sql_string 间接验证；
+        // import_sql_string 返回 Ok 即可证明头部校验通过。
         let dst = Database::memory()?;
         dst.import_sql_string(&dump)?;
 
         Ok(())
     }
 
-    /// skip_tables が効く：SYNC_SKIP_TABLES のデータは sync dump に含まれないが
-    /// フル dump には含まれる
+    /// skip_tables 生效验证：SYNC_SKIP_TABLES 中的数据不出现在 sync dump 中，
+    /// 但在完整 dump 中存在
     #[test]
     fn skip_tables_honored_in_sync_dump() -> Result<(), AppError> {
         let db = Database::memory()?;
