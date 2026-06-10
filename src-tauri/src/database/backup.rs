@@ -10,8 +10,24 @@ use rusqlite::backup::Backup;
 use rusqlite::types::ValueRef;
 use rusqlite::Connection;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
+
+/// 临时文件快照：持有快照文件和对应的 SQLite 连接。
+///
+/// `conn` 先于 `_temp` 声明，确保 drop 顺序为先关闭 SQLite 句柄，再删除临时文件。
+/// 在 Windows 上 SQLite 持有独占锁，若反序 drop 会导致 NamedTempFile::drop 静默失败，临时文件泄漏。
+pub(crate) struct DbSnapshot {
+    conn: Connection,
+    _temp: NamedTempFile,
+}
+
+impl DbSnapshot {
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+}
 
 const CC_SWITCH_SQL_EXPORT_HEADER: &str = "-- CC Switch SQLite 导出";
 
@@ -43,27 +59,81 @@ pub struct BackupEntry {
 }
 
 impl Database {
-    /// 导出为 SQLite 兼容的 SQL 文本（内存字符串，完整导出）
+    /// 导出为 SQLite 兼容的 SQL 文本（内存缓冲，完整导出）。
+    ///
+    /// **仅用于小型数据库或测试**。大型导出应使用 [`export_sql`] 流式路径。
     pub fn export_sql_string(&self) -> Result<String, AppError> {
-        let snapshot = self.snapshot_to_memory()?;
-        Self::dump_sql(&snapshot, &[])
+        let snapshot = self.snapshot_to_file()?;
+        let mut buf: Vec<u8> = Vec::new();
+        Self::dump_sql_to_writer(snapshot.conn(), &[], &mut buf)?;
+        String::from_utf8(buf)
+            .map_err(|e| AppError::Database(format!("SQL dump 包含无效 UTF-8: {e}")))
     }
 
-    /// Export SQL for sync (WebDAV), skipping local-only tables' data
+    /// Export SQL for sync (WebDAV), skipping local-only tables' data.
+    ///
+    /// **仅用于小型数据库或测试**。F1-B 将使该路径完全流式化。
     pub fn export_sql_string_for_sync(&self) -> Result<String, AppError> {
-        let snapshot = self.snapshot_to_memory()?;
-        Self::dump_sql(&snapshot, SYNC_SKIP_TABLES)
+        let snapshot = self.snapshot_to_file()?;
+        let mut buf: Vec<u8> = Vec::new();
+        Self::dump_sql_to_writer(snapshot.conn(), SYNC_SKIP_TABLES, &mut buf)?;
+        String::from_utf8(buf)
+            .map_err(|e| AppError::Database(format!("SQL dump 包含无效 UTF-8: {e}")))
     }
 
-    /// 导出为 SQLite 兼容的 SQL 文本
-    pub fn export_sql(&self, target_path: &Path) -> Result<(), AppError> {
-        let dump = self.export_sql_string()?;
+    /// Export sync SQL directly to a writer (streaming, zero copy-into-Vec).
+    ///
+    /// Skips the same `SYNC_SKIP_TABLES` as [`export_sql_string_for_sync`].
+    /// The byte format is identical — this is the F1-B streaming path.
+    pub fn export_sql_to_writer_for_sync<W: Write>(&self, w: &mut W) -> Result<(), AppError> {
+        let snapshot = self.snapshot_to_file()?;
+        Self::dump_sql_to_writer(snapshot.conn(), SYNC_SKIP_TABLES, w)
+    }
 
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
+    /// 导出为 SQLite 兼容的 SQL 文本，流式写入目标文件（原子替换）。
+    ///
+    /// 全程无 O(DB 大小) 内存分配：快照写临时文件，dump 直接流式写入，
+    /// 最后 persist 原子替换目标路径。临时文件由 NamedTempFile RAII 管理，
+    /// 任何错误路径均自动清理，不泄漏 .tmp 文件。
+    pub fn export_sql(&self, target_path: &Path) -> Result<(), AppError> {
+        let parent = target_path
+            .parent()
+            .ok_or_else(|| AppError::Config("无效的导出路径".to_string()))?;
+
+        fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
+
+        // 在目标目录创建临时文件，保证 persist 是同一挂载点内的原子操作；
+        // NamedTempFile 在任何提前返回时自动删除临时文件。
+        let mut tmp = NamedTempFile::new_in(parent).map_err(|e| AppError::IoContext {
+            context: "创建导出临时文件失败".to_string(),
+            source: e,
+        })?;
+        // 提前捕获路径，避免 flush 错误闭包与可变借用冲突。
+        let tmp_path_for_err = tmp.path().to_path_buf();
+
+        {
+            let mut writer = BufWriter::new(tmp.as_file_mut());
+            let snapshot = self.snapshot_to_file()?;
+            Self::dump_sql_to_writer(snapshot.conn(), &[], &mut writer)?;
+            writer
+                .flush()
+                .map_err(|e| AppError::io(&tmp_path_for_err, e))?;
         }
 
-        crate::config::atomic_write(target_path, dump.as_bytes())
+        #[cfg(windows)]
+        if target_path.exists() {
+            fs::remove_file(target_path).map_err(|e| AppError::IoContext {
+                context: format!("覆盖前删除目标文件失败: {}", target_path.display()),
+                source: e,
+            })?;
+        }
+
+        tmp.persist(target_path).map_err(|e| AppError::IoContext {
+            context: format!("原子替换导出文件失败: {}", target_path.display()),
+            source: e.error,
+        })?;
+
+        Ok(())
     }
 
     /// 从 SQL 文件导入，返回生成的备份 ID（若无备份则为空字符串）
@@ -105,7 +175,7 @@ impl Database {
         let local_snapshot = if preserve_tables.is_empty() {
             None
         } else {
-            Some(self.snapshot_to_memory()?)
+            Some(self.snapshot_to_file()?)
         };
 
         // 在临时数据库执行导入，确保失败不会污染主库
@@ -126,7 +196,7 @@ impl Database {
         Self::apply_schema_migrations_on_conn(&temp_conn)?;
         Self::validate_basic_state(&temp_conn)?;
         if let Some(local_snapshot) = local_snapshot.as_ref() {
-            Self::restore_tables(local_snapshot, &temp_conn, preserve_tables)?;
+            Self::restore_tables(local_snapshot.conn(), &temp_conn, preserve_tables)?;
         }
 
         // 使用 Backup 将临时库原子写回主库
@@ -146,21 +216,30 @@ impl Database {
         Ok(backup_id)
     }
 
-    /// 创建内存快照以避免长时间持有数据库锁
-    pub(crate) fn snapshot_to_memory(&self) -> Result<Connection, AppError> {
-        let conn = lock_conn!(self.conn);
-        let mut snapshot =
-            Connection::open_in_memory().map_err(|e| AppError::Database(e.to_string()))?;
+    /// 创建临时文件快照以避免长时间持有数据库锁。
+    ///
+    /// 快照写入临时文件（而非内存），不产生 O(DB 大小) 的 RAM 分配。
+    /// 返回的 [`DbSnapshot`] 持有临时文件和连接的所有权，两者同时释放。
+    pub(crate) fn snapshot_to_file(&self) -> Result<DbSnapshot, AppError> {
+        let temp = NamedTempFile::new().map_err(|e| AppError::IoContext {
+            context: "创建快照临时文件失败".to_string(),
+            source: e,
+        })?;
+        let temp_path = temp.path().to_path_buf();
 
         {
+            let src = lock_conn!(self.conn);
+            let mut dest =
+                Connection::open(&temp_path).map_err(|e| AppError::Database(e.to_string()))?;
             let backup =
-                Backup::new(&conn, &mut snapshot).map_err(|e| AppError::Database(e.to_string()))?;
+                Backup::new(&src, &mut dest).map_err(|e| AppError::Database(e.to_string()))?;
             backup
                 .step(-1)
                 .map_err(|e| AppError::Database(e.to_string()))?;
         }
 
-        Ok(snapshot)
+        let conn = Connection::open(&temp_path).map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(DbSnapshot { _temp: temp, conn })
     }
 
     fn validate_cc_switch_sql_export(sql: &str) -> Result<(), AppError> {
@@ -383,20 +462,33 @@ impl Database {
         Ok(())
     }
 
-    /// 导出数据库为 SQL 文本
-    fn dump_sql(conn: &Connection, skip_tables: &[&str]) -> Result<String, AppError> {
-        let mut output = String::new();
+    /// 将数据库 dump 为 SQL 文本，流式写入 `w`。
+    ///
+    /// 不在内存中积累整个 dump 字符串；每条 INSERT / schema 行写完后立即
+    /// 传给 writer，内存峰值仅为单行缓冲。字节格式与旧版 `dump_sql` 完全一致。
+    fn dump_sql_to_writer<W: Write>(
+        conn: &Connection,
+        skip_tables: &[&str],
+        w: &mut W,
+    ) -> Result<(), AppError> {
+        let map_io = |e: std::io::Error| AppError::IoContext {
+            context: "写入 SQL dump 失败".to_string(),
+            source: e,
+        };
+
         let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let user_version: i64 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
-            .unwrap_or(0);
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-        output.push_str(&format!(
+        write!(
+            w,
             "-- CC Switch SQLite 导出\n-- 生成时间: {timestamp}\n-- user_version: {user_version}\n"
-        ));
-        output.push_str("PRAGMA foreign_keys=OFF;\n");
-        output.push_str(&format!("PRAGMA user_version={user_version};\n"));
-        output.push_str("BEGIN TRANSACTION;\n");
+        )
+        .map_err(map_io)?;
+        w.write_all(b"PRAGMA foreign_keys=OFF;\n").map_err(map_io)?;
+        writeln!(w, "PRAGMA user_version={user_version};").map_err(map_io)?;
+        w.write_all(b"BEGIN TRANSACTION;\n").map_err(map_io)?;
 
         // 导出 schema
         let mut stmt = conn
@@ -422,8 +514,8 @@ impl Database {
                 continue;
             }
 
-            output.push_str(&sql);
-            output.push_str(";\n");
+            w.write_all(sql.as_bytes()).map_err(map_io)?;
+            w.write_all(b";\n").map_err(map_io)?;
 
             if obj_type == "table" && !name.starts_with("sqlite_") {
                 tables.push(name);
@@ -439,6 +531,12 @@ impl Database {
             if columns.is_empty() {
                 continue;
             }
+
+            let cols = columns
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
 
             let mut stmt = conn
                 .prepare(&format!("SELECT * FROM \"{table}\""))
@@ -456,20 +554,18 @@ impl Database {
                     values.push(Self::format_sql_value(value)?);
                 }
 
-                let cols = columns
-                    .iter()
-                    .map(|c| format!("\"{c}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                output.push_str(&format!(
-                    "INSERT INTO \"{table}\" ({cols}) VALUES ({});\n",
+                writeln!(
+                    w,
+                    "INSERT INTO \"{table}\" ({cols}) VALUES ({});",
                     values.join(", ")
-                ));
+                )
+                .map_err(map_io)?;
             }
         }
 
-        output.push_str("COMMIT;\nPRAGMA foreign_keys=ON;\n");
-        Ok(output)
+        w.write_all(b"COMMIT;\nPRAGMA foreign_keys=ON;\n")
+            .map_err(map_io)?;
+        Ok(())
     }
 
     /// 获取表的列名列表
@@ -689,10 +785,229 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use super::{Database, CC_SWITCH_SQL_EXPORT_HEADER};
     use crate::error::AppError;
     use crate::settings::{update_settings, AppSettings};
     use serial_test::serial;
+
+    // ── F1-A: 流式导出测试 ─────────────────────────────────────────────────
+
+    /// 完整往返：seed DB → export_sql 到文件 → import_sql 到新 DB → 行一致
+    #[test]
+    fn export_sql_file_roundtrip() -> Result<(), AppError> {
+        let src = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(src.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-rt', 'claude', 'Roundtrip Provider', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO mcp_servers (id, name, server_config)
+                 VALUES ('m-rt', 'RT MCP', '{}')",
+                [],
+            )?;
+        }
+
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let export_path = tmp_dir.path().join("export.sql");
+
+        src.export_sql(&export_path)?;
+        assert!(export_path.exists(), "export file should exist");
+
+        let dst = Database::memory()?;
+        dst.import_sql(&export_path)?;
+
+        let (providers, mcps): (i64, i64) = {
+            let conn = crate::database::lock_conn!(dst.conn);
+            let p = conn.query_row(
+                "SELECT COUNT(*) FROM providers WHERE id = 'p-rt'",
+                [],
+                |r| r.get(0),
+            )?;
+            let m = conn.query_row(
+                "SELECT COUNT(*) FROM mcp_servers WHERE id = 'm-rt'",
+                [],
+                |r| r.get(0),
+            )?;
+            (p, m)
+        };
+        assert_eq!(providers, 1, "provider row should round-trip");
+        assert_eq!(mcps, 1, "mcp_server row should round-trip");
+
+        Ok(())
+    }
+
+    /// 原子覆盖合约：对同一路径二次导出时，目标文件内容以第二次导出的数据为准。
+    /// 验证 export_sql 的 persist 路径在目标已存在时能正确替换。
+    #[test]
+    fn export_sql_overwrites_existing_file() -> Result<(), AppError> {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let export_path = tmp_dir.path().join("overwrite_test.sql");
+
+        // 第一次导出：只有 provider p-ow1
+        let db1 = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db1.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-ow1', 'claude', 'OW Provider 1', '{}', '{}')",
+                [],
+            )?;
+        }
+        db1.export_sql(&export_path)?;
+        assert!(
+            export_path.exists(),
+            "export file should exist after first export"
+        );
+
+        // 第二次导出：有 provider p-ow1 和 p-ow2 两行
+        let db2 = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db2.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-ow1', 'claude', 'OW Provider 1', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-ow2', 'claude', 'OW Provider 2', '{}', '{}')",
+                [],
+            )?;
+        }
+        db2.export_sql(&export_path)?;
+
+        // 导入覆盖后的文件，验证行数为 2（第二次导出的内容）
+        let dst = Database::memory()?;
+        dst.import_sql(&export_path)?;
+        let provider_count: i64 = {
+            let conn = crate::database::lock_conn!(dst.conn);
+            conn.query_row(
+                "SELECT COUNT(*) FROM providers WHERE id IN ('p-ow1','p-ow2')",
+                [],
+                |r| r.get(0),
+            )?
+        };
+        assert_eq!(
+            provider_count, 2,
+            "导出文件应被第二次导出原子覆盖，包含 2 行 provider"
+        );
+
+        Ok(())
+    }
+
+    /// dump 幂等性：同一 DB 两次导出字节相同（时间戳外的结构体积稳定）
+    /// 严格验证：输出以 CC_SWITCH_SQL_EXPORT_HEADER 开头，且通过 validate 函数
+    #[test]
+    fn export_sql_string_starts_with_header_and_validates() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-hdr', 'claude', 'Header Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+
+        let dump = db.export_sql_string()?;
+        assert!(
+            dump.trim_start().starts_with(CC_SWITCH_SQL_EXPORT_HEADER),
+            "dump should start with header, got: {}",
+            &dump[..dump.len().min(80)]
+        );
+
+        // validate_cc_switch_sql_export 非 pub(crate)，通过 import_sql_string 间接验证；
+        // import_sql_string 返回 Ok 即可证明头部校验通过。
+        let dst = Database::memory()?;
+        dst.import_sql_string(&dump)?;
+
+        Ok(())
+    }
+
+    /// skip_tables 生效验证：SYNC_SKIP_TABLES 中的数据不出现在 sync dump 中，
+    /// 但在完整 dump 中存在
+    #[test]
+    fn skip_tables_honored_in_sync_dump() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            // sync_skip_tables のうち proxy_request_logs にデータを入れる
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-skip', 'claude', 'Skip Provider', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at
+                ) VALUES ('req-skip', 'p-skip', 'claude', 'claude-3', 10, 5, '0.001', 50, 200, 1000)",
+                [],
+            )?;
+        }
+
+        // sync dump should NOT contain the log row
+        let sync_dump = db.export_sql_string_for_sync()?;
+        assert!(
+            !sync_dump.contains("req-skip"),
+            "sync dump must not contain proxy_request_logs rows"
+        );
+
+        // full dump SHOULD contain the log row
+        let full_dump = db.export_sql_string()?;
+        assert!(
+            full_dump.contains("req-skip"),
+            "full dump must contain proxy_request_logs rows"
+        );
+
+        // 验证 SYNC_SKIP_TABLES 全部不在 sync dump 数据中
+        // （表定义仍然会出现，只是行数据不出现）
+        // 我们用 import 后验证行数来确认
+        let dst = Database::memory()?;
+        dst.import_sql_string(&sync_dump)?;
+        let log_count: i64 = {
+            let conn = crate::database::lock_conn!(dst.conn);
+            conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |r| r.get(0))?
+        };
+        assert_eq!(log_count, 0, "imported sync dump should have 0 log rows");
+
+        Ok(())
+    }
+
+    /// 相同数据 dump 两次，结构相同（时间戳不同但行内容完全一致）。
+    /// 通过去掉生成时间行后比较其余内容来验证 dump 确定性。
+    #[test]
+    fn dump_determinism_excluding_timestamp() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-det', 'claude', 'Det Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+
+        let strip_ts = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.starts_with("-- 生成时间:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let dump1 = strip_ts(&db.export_sql_string()?);
+        let dump2 = strip_ts(&db.export_sql_string()?);
+        assert_eq!(
+            dump1, dump2,
+            "dumps of same DB should be identical (modulo timestamp)"
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn sync_import_preserves_local_only_tables() -> Result<(), AppError> {
@@ -854,6 +1169,95 @@ mod tests {
             Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
             None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
         }
+
+        Ok(())
+    }
+
+    // ── F1-B: 流式 sync 导出测试 ───────────────────────────────────────────
+
+    /// export_sql_to_writer_for_sync 的字节输出与 export_sql_string_for_sync 完全相同
+    /// （时间戳行除外），证明 wire format 兼容性不变。
+    #[test]
+    fn export_sql_to_writer_for_sync_matches_string_variant() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-f1b', 'claude', 'F1B Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+
+        // string variant (old path)
+        let string_dump = db.export_sql_string_for_sync()?;
+
+        // writer variant (new streaming path)
+        let mut buf: Vec<u8> = Vec::new();
+        db.export_sql_to_writer_for_sync(&mut buf)?;
+        let writer_dump = String::from_utf8(buf).expect("writer dump should be valid UTF-8");
+
+        // Strip timestamp line before comparing — timestamps differ between calls.
+        let strip_ts = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.starts_with("-- 生成时间:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        assert_eq!(
+            strip_ts(&string_dump),
+            strip_ts(&writer_dump),
+            "streaming writer variant must produce identical content to string variant"
+        );
+        Ok(())
+    }
+
+    /// export_sql_to_writer_for_sync skips SYNC_SKIP_TABLES 数据行 but writes their schema.
+    #[test]
+    fn export_sql_to_writer_for_sync_skips_skip_tables() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('p-f1b2', 'claude', 'F1B2 Provider', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model,
+                    input_tokens, output_tokens, total_cost_usd,
+                    latency_ms, status_code, created_at
+                ) VALUES ('req-f1b', 'p-f1b2', 'claude', 'claude-3', 1, 1, '0.0', 10, 200, 1)",
+                [],
+            )?;
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        db.export_sql_to_writer_for_sync(&mut buf)?;
+        let dump = String::from_utf8(buf).expect("valid UTF-8");
+
+        assert!(
+            !dump.contains("req-f1b"),
+            "streaming sync dump must not contain proxy_request_logs rows"
+        );
+        assert!(
+            dump.starts_with(CC_SWITCH_SQL_EXPORT_HEADER),
+            "streaming sync dump must start with CC Switch export header"
+        );
+
+        // Confirm the output is importable
+        let dst = Database::memory()?;
+        dst.import_sql_string(&dump)?;
+        let count: i64 = {
+            let conn = crate::database::lock_conn!(dst.conn);
+            conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |r| r.get(0))?
+        };
+        assert_eq!(
+            count, 0,
+            "imported streaming sync dump should have 0 log rows"
+        );
 
         Ok(())
     }

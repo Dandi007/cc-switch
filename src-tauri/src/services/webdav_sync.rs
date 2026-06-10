@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
+use std::io::{BufWriter, Read, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -18,7 +20,7 @@ use tempfile::tempdir;
 use crate::error::AppError;
 use crate::services::webdav::{
     auth_from_credentials, build_remote_url, ensure_remote_directories, get_bytes, head_etag,
-    path_segments, put_bytes, test_connection, WebDavAuth,
+    path_segments, put_bytes, put_file, test_connection, WebDavAuth,
 };
 use crate::settings::{update_webdav_sync_status, WebDavSyncSettings, WebDavSyncStatus};
 
@@ -93,7 +95,10 @@ struct ArtifactMeta {
 }
 
 struct LocalSnapshot {
-    db_sql: Vec<u8>,
+    /// Temporary file holding the db.sql dump; kept alive until upload completes.
+    db_sql_file: tempfile::NamedTempFile,
+    /// Size of the db.sql dump in bytes (from file metadata after writing).
+    db_sql_size: u64,
     skills_zip: Vec<u8>,
     manifest_bytes: Vec<u8>,
     manifest_hash: String,
@@ -147,7 +152,14 @@ pub async fn upload(
 
     // Upload order: artifacts first, manifest last (best-effort consistency)
     let db_url = remote_file_url(settings, RemoteLayout::Current, REMOTE_DB_SQL)?;
-    put_bytes(&db_url, &auth, snapshot.db_sql, "application/sql").await?;
+    put_file(
+        &db_url,
+        &auth,
+        snapshot.db_sql_file.path(),
+        snapshot.db_sql_size,
+        "application/sql",
+    )
+    .await?;
 
     let skills_url = remote_file_url(settings, RemoteLayout::Current, REMOTE_SKILLS_ZIP)?;
     put_bytes(&skills_url, &auth, snapshot.skills_zip, "application/zip").await?;
@@ -302,9 +314,22 @@ fn build_local_snapshot(
     db: &crate::database::Database,
     _settings: &WebDavSyncSettings,
 ) -> Result<LocalSnapshot, AppError> {
-    // Export database to SQL string
-    let sql_string = db.export_sql_string_for_sync()?;
-    let db_sql = sql_string.into_bytes();
+    // Stream database dump to a temp file — no O(DB) Vec allocation.
+    let mut db_sql_file = tempfile::NamedTempFile::new().map_err(|e| AppError::IoContext {
+        context: "创建 db.sql 临时文件失败".to_string(),
+        source: e,
+    })?;
+    {
+        let mut writer = BufWriter::new(db_sql_file.as_file_mut());
+        db.export_sql_to_writer_for_sync(&mut writer)?;
+        writer.flush().map_err(|e| AppError::IoContext {
+            context: "flush db.sql 临时文件失败".to_string(),
+            source: e,
+        })?;
+    }
+
+    // Compute sha256 + size by streaming the file (no full-file Vec).
+    let (db_sql_sha256, db_sql_size) = sha256_file(db_sql_file.path())?;
 
     // Pack skills into deterministic ZIP
     let tmp = tempdir().map_err(|e| {
@@ -324,8 +349,8 @@ fn build_local_snapshot(
     artifacts.insert(
         REMOTE_DB_SQL.to_string(),
         ArtifactMeta {
-            sha256: sha256_hex(&db_sql),
-            size: db_sql.len() as u64,
+            sha256: db_sql_sha256,
+            size: db_sql_size,
         },
     );
     artifacts.insert(
@@ -351,11 +376,42 @@ fn build_local_snapshot(
     let manifest_hash = sha256_hex(&manifest_bytes);
 
     Ok(LocalSnapshot {
-        db_sql,
+        db_sql_file,
+        db_sql_size,
         skills_zip,
         manifest_bytes,
         manifest_hash,
     })
+}
+
+/// Compute sha256 and byte-size of a file by reading in 64KiB chunks.
+///
+/// Both the hash and the returned size come from the same single read pass,
+/// eliminating any metadata/stream mismatch that could produce a wrong
+/// Content-Length when the value is later used as a WebDAV upload header.
+///
+/// Produces the same hex digest as `sha256_hex` for identical content.
+fn sha256_file(path: &Path) -> Result<(String, u64), AppError> {
+    let mut file = fs::File::open(path).map_err(|e| AppError::IoContext {
+        context: format!("打开文件计算 sha256 失败: {}", path.display()),
+        source: e,
+    })?;
+
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    let mut total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).map_err(|e| AppError::IoContext {
+            context: format!("读取文件内容失败: {}", path.display()),
+            source: e,
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((format!("{:x}", hasher.finalize()), total))
 }
 
 /// Compute a deterministic snapshot identity from artifact hashes.
@@ -880,5 +936,46 @@ mod tests {
     #[test]
     fn validate_artifact_size_limit_accepts_limit_boundary() {
         assert!(validate_artifact_size_limit("skills.zip", MAX_SYNC_ARTIFACT_BYTES).is_ok());
+    }
+
+    /// sha256_file must produce the same digest as sha256_hex for identical bytes.
+    #[test]
+    fn sha256_file_matches_sha256_hex_for_same_content() {
+        let content = b"cc-switch WebDAV sync streaming sha256 stability test";
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), content).expect("write");
+
+        let (file_hex, size) = sha256_file(tmp.path()).expect("sha256_file");
+        let bytes_hex = sha256_hex(content);
+
+        assert_eq!(
+            file_hex, bytes_hex,
+            "sha256_file must equal sha256_hex for identical content"
+        );
+        assert_eq!(
+            size,
+            content.len() as u64,
+            "sha256_file must report correct byte size"
+        );
+    }
+
+    /// sha256_file with a multi-chunk file (>64KiB) still matches sha256_hex.
+    #[test]
+    fn sha256_file_matches_sha256_hex_for_large_content() {
+        // 128KiB to force multiple 64KiB read chunks
+        let content: Vec<u8> = (0u8..=255).cycle().take(128 * 1024).collect();
+
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(tmp.path(), &content).expect("write");
+
+        let (file_hex, size) = sha256_file(tmp.path()).expect("sha256_file large");
+        let bytes_hex = sha256_hex(&content);
+
+        assert_eq!(
+            file_hex, bytes_hex,
+            "sha256_file must equal sha256_hex for large content"
+        );
+        assert_eq!(size, content.len() as u64);
     }
 }
