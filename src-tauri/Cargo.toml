@@ -85,6 +85,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 json5 = "0.4"
 json-five = "0.3.1"
 env_logger = "0.11"
+mimalloc = "0.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"
