@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug)]
 struct Cli {
     pretty: bool,
