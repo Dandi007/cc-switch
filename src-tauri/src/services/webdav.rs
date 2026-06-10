@@ -12,6 +12,11 @@ use futures::StreamExt;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Timeout for large file transfers (PUT/GET of db.sql, skills.zip).
+///
+/// This covers the ENTIRE transfer — connect + full body send/receive — not just
+/// the initial connection. For very large DB dumps the value must be generous
+/// enough to accommodate the complete streaming upload or download at the
+/// available network speed.
 const TRANSFER_TIMEOUT_SECS: u64 = 300;
 
 /// Auth pair: `(username, Some(password))`.
@@ -252,6 +257,14 @@ pub async fn put_bytes(
 /// The file is read in chunks — the full content is never buffered in memory.
 /// An explicit `Content-Length` header is set from the known `content_length`
 /// so that WebDAV servers that reject chunked transfer encoding work correctly.
+///
+/// **Non-replayable body**: the request body is a one-shot stream
+/// (`Body::wrap_stream`) and cannot be replayed. This PUT therefore does not
+/// support redirect-following; any redirect returned by the server will result
+/// in an error rather than a transparent retry on the new location.
+///
+/// The timeout applied here covers the complete transfer (connect + full body
+/// send); see [`TRANSFER_TIMEOUT_SECS`] for the rationale.
 pub async fn put_file(
     url: &str,
     auth: &WebDavAuth,
@@ -265,7 +278,8 @@ pub async fn put_file(
             context: format!("打开上传临时文件失败: {}", path.display()),
             source: e,
         })?;
-    let stream = tokio_util::io::ReaderStream::new(file);
+    // Use the same 64 KiB chunk size as sha256_file for consistency.
+    let stream = tokio_util::io::ReaderStream::with_capacity(file, 65536);
     let body = reqwest::Body::wrap_stream(stream);
 
     let client = http_client::get();

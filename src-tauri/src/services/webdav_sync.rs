@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -386,23 +386,20 @@ fn build_local_snapshot(
 
 /// Compute sha256 and byte-size of a file by reading in 64KiB chunks.
 ///
+/// Both the hash and the returned size come from the same single read pass,
+/// eliminating any metadata/stream mismatch that could produce a wrong
+/// Content-Length when the value is later used as a WebDAV upload header.
+///
 /// Produces the same hex digest as `sha256_hex` for identical content.
 fn sha256_file(path: &Path) -> Result<(String, u64), AppError> {
-    use std::io::Read;
     let mut file = fs::File::open(path).map_err(|e| AppError::IoContext {
         context: format!("打开文件计算 sha256 失败: {}", path.display()),
         source: e,
     })?;
-    let size = file
-        .metadata()
-        .map_err(|e| AppError::IoContext {
-            context: format!("读取文件元数据失败: {}", path.display()),
-            source: e,
-        })?
-        .len();
 
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
+    let mut total: u64 = 0;
     loop {
         let n = file.read(&mut buf).map_err(|e| AppError::IoContext {
             context: format!("读取文件内容失败: {}", path.display()),
@@ -412,8 +409,9 @@ fn sha256_file(path: &Path) -> Result<(String, u64), AppError> {
             break;
         }
         hasher.update(&buf[..n]);
+        total += n as u64;
     }
-    Ok((format!("{:x}", hasher.finalize()), size))
+    Ok((format!("{:x}", hasher.finalize()), total))
 }
 
 /// Compute a deterministic snapshot identity from artifact hashes.

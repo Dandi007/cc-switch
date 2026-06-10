@@ -1213,7 +1213,7 @@ mod tests {
         Ok(())
     }
 
-    /// export_sql_to_writer_for_sync skips SYNC_SKIP_TABLES データ行 but writes their schema.
+    /// export_sql_to_writer_for_sync skips SYNC_SKIP_TABLES 数据行 but writes their schema.
     #[test]
     fn export_sql_to_writer_for_sync_skips_skip_tables() -> Result<(), AppError> {
         let db = Database::memory()?;
