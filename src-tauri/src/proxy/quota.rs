@@ -152,6 +152,37 @@ pub fn parse_codex_headers(h: &http::HeaderMap, now_unix: i64) -> Option<CodexQu
     })
 }
 
+use crate::provider::{UsageData, UsageResult};
+
+fn human_secs(secs: i64) -> String {
+    if secs <= 0 { return "已重置".into(); }
+    let h = secs / 3600;
+    if h >= 24 { format!("{}d后重置", h / 24) }
+    else if h >= 1 { format!("{}h后重置", h) }
+    else { format!("{}m后重置", secs / 60) }
+}
+
+pub fn snapshot_to_usage_result(s: &CodexQuotaSnapshot) -> UsageResult {
+    let mk = |used: f64, win_min: u32, reset: i64, tag: &str| UsageData {
+        plan_name: Some(s.plan_type.clone()),
+        extra: Some(format!("{tag} {}min窗 · {}", win_min, human_secs(reset))),
+        is_valid: Some(true),
+        invalid_message: None,
+        total: Some(100.0),
+        used: Some(used),
+        remaining: Some(100.0 - used),
+        unit: Some("%".to_string()),
+    };
+    UsageResult {
+        success: true,
+        data: Some(vec![
+            mk(s.primary_used_percent, s.primary_window_minutes, s.primary_reset_after_seconds, "primary"),
+            mk(s.secondary_used_percent, s.secondary_window_minutes, s.secondary_reset_after_seconds, "secondary"),
+        ]),
+        error: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +256,26 @@ mod tests {
     fn parse_codex_headers_absent_returns_none() {
         let h = http::HeaderMap::new();
         assert!(parse_codex_headers(&h, 0).is_none());
+    }
+
+    #[test]
+    fn snapshot_maps_to_two_windows() {
+        let s = CodexQuotaSnapshot {
+            plan_type: "prolite".into(),
+            primary_used_percent: 0.0,
+            primary_window_minutes: 300,
+            primary_reset_after_seconds: 18000,
+            secondary_used_percent: 2.0,
+            secondary_window_minutes: 10080,
+            secondary_reset_after_seconds: 528493,
+            captured_at: 0,
+        };
+        let r = snapshot_to_usage_result(&s);
+        assert!(r.success);
+        let data = r.data.expect("有 data");
+        assert_eq!(data.len(), 2, "主+次两个窗口");
+        assert_eq!(data[0].remaining, Some(100.0));
+        assert_eq!(data[0].unit.as_deref(), Some("%"));
+        assert_eq!(data[1].remaining, Some(98.0));
     }
 }
