@@ -2442,6 +2442,7 @@ mod tests {
             streaming_first_byte_timeout,
             max_attempts: 1,
             model_capability: None,
+            codex_quota: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -3096,6 +3097,7 @@ mod tests {
             streaming_first_byte_timeout: Duration::from_secs(30),
             max_attempts: 1,
             model_capability: Some(resolver),
+            codex_quota: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
