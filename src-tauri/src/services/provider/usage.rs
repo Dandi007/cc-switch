@@ -145,19 +145,25 @@ pub async fn query_usage_with_db(
         }
 
         // Get credentials: prioritize UsageScript values, fallback to provider config
-        let api_key = usage_script
-            .api_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .or_else(|| extract_api_key_from_provider(provider))
-            .unwrap_or_default();
+        // 解析 {env:NAME} 占位符（与 proxy 转发侧一致）：usage_script 里常以
+        // `{env:LINGZHI_API_KEY}` 形式存凭据，直接透传会被上游 401。
+        let api_key = crate::proxy::quota::resolve_env_reference(
+            &usage_script
+                .api_key
+                .clone()
+                .filter(|k| !k.is_empty())
+                .or_else(|| extract_api_key_from_provider(provider))
+                .unwrap_or_default(),
+        );
 
-        let base_url = usage_script
-            .base_url
-            .clone()
-            .filter(|u| !u.is_empty())
-            .or_else(|| extract_base_url_from_provider(provider))
-            .unwrap_or_default();
+        let base_url = crate::proxy::quota::resolve_env_reference(
+            &usage_script
+                .base_url
+                .clone()
+                .filter(|u| !u.is_empty())
+                .or_else(|| extract_base_url_from_provider(provider))
+                .unwrap_or_default(),
+        );
 
         (
             usage_script.code.clone(),
