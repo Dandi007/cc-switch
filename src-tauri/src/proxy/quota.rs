@@ -159,6 +159,15 @@ pub fn parse_codex_headers(h: &http::HeaderMap, now_unix: i64) -> Option<CodexQu
 
 use crate::provider::{UsageData, UsageResult};
 
+/// 解析 {env:NAME} 占位符为环境变量值；非占位符原样返回
+pub fn resolve_env_reference(raw: &str) -> String {
+    let t = raw.trim();
+    if let Some(name) = t.strip_prefix("{env:").and_then(|v| v.strip_suffix('}')) {
+        return std::env::var(name).unwrap_or_else(|_| raw.to_string());
+    }
+    raw.to_string()
+}
+
 fn human_secs(secs: i64) -> String {
     if secs <= 0 { return "已重置".into(); }
     let h = secs / 3600;

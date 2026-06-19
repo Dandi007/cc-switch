@@ -109,14 +109,14 @@ fn extract_base_url_from_provider(provider: &crate::provider::Provider) -> Optio
     }
 }
 
-/// Query provider usage (using saved script configuration)
-pub async fn query_usage(
-    state: &AppState,
+/// Query provider usage with a direct `&Database` reference (proxy-side callable).
+pub async fn query_usage_with_db(
+    db: &crate::database::Database,
     app_type: AppType,
     provider_id: &str,
 ) -> Result<UsageResult, AppError> {
     let (script_code, timeout, api_key, base_url, access_token, user_id, template_type) = {
-        let providers = state.db.get_all_providers(app_type.as_str())?;
+        let providers = db.get_all_providers(app_type.as_str())?;
         let provider = providers.get(provider_id).ok_or_else(|| {
             AppError::localized(
                 "provider.not_found",
@@ -180,6 +180,15 @@ pub async fn query_usage(
         template_type.as_deref(),
     )
     .await
+}
+
+/// Query provider usage (using saved script configuration)
+pub async fn query_usage(
+    state: &AppState,
+    app_type: AppType,
+    provider_id: &str,
+) -> Result<UsageResult, AppError> {
+    query_usage_with_db(&state.db, app_type, provider_id).await
 }
 
 /// Test usage script (using temporary script content, not saved)
