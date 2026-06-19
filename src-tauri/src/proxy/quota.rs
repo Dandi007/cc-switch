@@ -197,6 +197,154 @@ pub fn snapshot_to_usage_result(s: &CodexQuotaSnapshot) -> UsageResult {
     }
 }
 
+// ============================================================================
+// HTTP handler — GET /quota
+// ============================================================================
+
+use axum::{
+    extract::{Query, State},
+    response::IntoResponse,
+    Json,
+};
+use serde::Deserialize;
+
+/// 查询参数：可选按 unit id 或 provider id 过滤
+#[derive(Deserialize, Default)]
+pub struct QuotaParams {
+    pub provider: Option<String>,
+    pub unit: Option<String>,
+}
+
+#[derive(Serialize)]
+struct QuotaEntry {
+    #[serde(flatten)]
+    unit: BillingUnit,
+    quota: crate::provider::UsageResult,
+}
+
+#[derive(Serialize)]
+struct QuotaResponse {
+    billing_units: Vec<QuotaEntry>,
+}
+
+/// GET /quota — 枚举所有 app_type 的 providers，去重为计费单元，返回各单元 quota。
+pub async fn handle_quota(
+    State(state): State<crate::proxy::server::ProxyState>,
+    Query(params): Query<QuotaParams>,
+) -> impl IntoResponse {
+    use crate::app_config::AppType;
+
+    // 1. 枚举所有 app_type 下的 providers，克隆为 owned Vec（避免借用跨 await）
+    let mut owned: Vec<(String, Vec<crate::provider::Provider>)> = Vec::new();
+    for app in AppType::all() {
+        if let Ok(map) = state.db.get_all_providers(app.as_str()) {
+            owned.push((
+                app.as_str().to_string(),
+                map.into_values().collect(),
+            ));
+        }
+    }
+
+    // 2. 构建引用切片传给 collect_units（纯函数）
+    let by_app: Vec<(String, Vec<&crate::provider::Provider>)> = owned
+        .iter()
+        .map(|(a, ps)| (a.clone(), ps.iter().collect()))
+        .collect();
+
+    let mut units = collect_units(&by_app);
+
+    // 3. 可选过滤
+    if let Some(uid) = &params.unit {
+        units.retain(|u| &u.id == uid);
+    }
+    if let Some(pid) = &params.provider {
+        units.retain(|u| u.members.contains(pid));
+    }
+    if (params.unit.is_some() || params.provider.is_some()) && units.is_empty() {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown unit or provider"})),
+        )
+            .into_response();
+    }
+
+    // 4. 逐单元查询 quota
+    let mut entries: Vec<QuotaEntry> = Vec::with_capacity(units.len());
+    for u in units {
+        let quota = match u.kind {
+            BillingKind::OauthAccount => {
+                // acct:<account_id> → 读内存快照
+                let acct = u.id.strip_prefix("acct:").unwrap_or(&u.id).to_string();
+                match state.codex_quota.read().await.get(&acct) {
+                    Some(snap) => snapshot_to_usage_result(snap),
+                    None => crate::provider::UsageResult {
+                        success: false,
+                        data: None,
+                        error: Some("暂无快照，先发一次 Codex 请求".to_string()),
+                    },
+                }
+            }
+            BillingKind::ApiKey => {
+                // 用第一个 member provider 执行 usage_script（同单元凭据相同）
+                let pid = u.members.first().cloned().unwrap_or_default();
+                // 找对应的 AppType
+                let app = AppType::all()
+                    .find(|a| a.as_str() == u.app_type)
+                    .unwrap_or(AppType::Codex);
+                match crate::services::provider::usage::query_usage_with_db(
+                    &state.db,
+                    app,
+                    &pid,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => crate::provider::UsageResult {
+                        success: false,
+                        data: None,
+                        error: Some(e.to_string()),
+                    },
+                }
+            }
+        };
+        entries.push(QuotaEntry { unit: u, quota });
+    }
+
+    Json(QuotaResponse {
+        billing_units: entries,
+    })
+    .into_response()
+}
+
+// ============================================================================
+// collect_units — 纯函数，枚举去重
+// ============================================================================
+
+/// 枚举多个 app_type 下的 providers，合并同一计费单元（相同 id 的去重并合并 members）。
+/// 纯函数，便于单测。
+pub fn collect_units(by_app: &[(String, Vec<&crate::provider::Provider>)]) -> Vec<BillingUnit> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, BillingUnit> = std::collections::HashMap::new();
+    for (app_type, providers) in by_app {
+        for p in providers {
+            if let Some(u) = billing_unit(p, app_type) {
+                if let Some(existing) = map.get_mut(&u.id) {
+                    // 同 id：合并 members（追加去重）
+                    for m in &u.members {
+                        if !existing.members.contains(m) {
+                            existing.members.push(m.clone());
+                        }
+                    }
+                } else {
+                    order.push(u.id.clone());
+                    map.insert(u.id.clone(), u);
+                }
+            }
+        }
+    }
+    order.into_iter().filter_map(|id| map.remove(&id)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +365,18 @@ mod tests {
             icon_color: None,
             in_failover_queue: false,
         }
+    }
+
+    #[test]
+    fn dedup_same_ak_merges_members() {
+        let s = json!({"base_url":"https://lingzhi.agibot.com/v1","apiKey":"sk-same000111"});
+        let p1 = mk_provider("lingzhi", json!({"usage_script":{"enabled":true,"language":"js","code":""}}), s.clone());
+        let p2 = mk_provider("lingzhi-copy", json!({"usage_script":{"enabled":true,"language":"js","code":""}}), s.clone());
+        let units = collect_units(&[("codex".to_string(), vec![&p1, &p2])]);
+        assert_eq!(units.len(), 1, "同 AK 去重为一个单元");
+        assert_eq!(units[0].members.len(), 2);
+        assert!(units[0].members.contains(&"lingzhi".to_string()));
+        assert!(units[0].members.contains(&"lingzhi-copy".to_string()));
     }
 
     #[test]

@@ -302,6 +302,7 @@ impl ProxyServer {
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))
+            .route("/quota", get(crate::proxy::quota::handle_quota))
             .route("/models", get(handlers::handle_openai_models))
             .route("/v1/models", get(handlers::handle_openai_models))
             .route("/codex/v1/models", get(handlers::handle_openai_models))
