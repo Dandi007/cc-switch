@@ -137,6 +137,8 @@ pub struct RequestForwarder {
     /// When `None` (e.g. in tests), `provider_model_supports_anthropic` returns
     /// `false` — the caller falls back to the provider-level base format.
     model_capability: Option<Arc<dyn ModelCapabilityResolver>>,
+    /// Codex OAuth 限流快照存储（按 account_id 索引）。
+    codex_quota: crate::proxy::quota::CodexQuotaStore,
 }
 
 impl RequestForwarder {
@@ -160,6 +162,7 @@ impl RequestForwarder {
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
         model_capability: Option<Arc<dyn ModelCapabilityResolver>>,
+        codex_quota: crate::proxy::quota::CodexQuotaStore,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -184,6 +187,7 @@ impl RequestForwarder {
             ),
             max_attempts,
             model_capability,
+            codex_quota,
         }
     }
 
@@ -1701,6 +1705,17 @@ impl RequestForwarder {
 
             // 检查响应状态
             let status = response.status();
+
+            // 被动捕获 Codex 计费单元限流快照（仅当本请求走了 codex oauth）
+            if let Some(account_id) = codex_oauth_account_id.clone() {
+                let now = chrono::Utc::now().timestamp();
+                if let Some(snap) = crate::proxy::quota::parse_codex_headers(response.headers(), now) {
+                    let store = self.codex_quota.clone();
+                    tokio::spawn(async move {
+                        store.write().await.insert(account_id, snap);
+                    });
+                }
+            }
 
             if status.is_success() {
                 let response = self
