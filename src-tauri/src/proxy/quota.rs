@@ -1,5 +1,10 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+pub type CodexQuotaStore = Arc<RwLock<HashMap<String, CodexQuotaSnapshot>>>;
 
 /// 打码：头 6 + … + 尾 4
 pub fn mask_key(k: &str) -> String {

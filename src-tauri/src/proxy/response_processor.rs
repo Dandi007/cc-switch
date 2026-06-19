@@ -1165,6 +1165,7 @@ mod tests {
             managed_auth: crate::proxy::server::ManagedAuthRegistry::default(),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
             model_capability: Arc::new(CachedModelCapabilityResolver::new()),
+            codex_quota: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
