@@ -112,6 +112,46 @@ pub struct BillingUnit {
     pub members: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexQuotaSnapshot {
+    pub plan_type: String,
+    pub primary_used_percent: f64,
+    pub primary_window_minutes: u32,
+    pub primary_reset_after_seconds: i64,
+    pub secondary_used_percent: f64,
+    pub secondary_window_minutes: u32,
+    pub secondary_reset_after_seconds: i64,
+    pub captured_at: i64,
+}
+
+fn hdr_str(h: &http::HeaderMap, k: &str) -> Option<String> {
+    h.get(k).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+}
+fn hdr_f64(h: &http::HeaderMap, k: &str) -> Option<f64> {
+    hdr_str(h, k).and_then(|s| s.parse().ok())
+}
+fn hdr_u32(h: &http::HeaderMap, k: &str) -> Option<u32> {
+    hdr_str(h, k).and_then(|s| s.parse().ok())
+}
+fn hdr_i64(h: &http::HeaderMap, k: &str) -> Option<i64> {
+    hdr_str(h, k).and_then(|s| s.parse().ok())
+}
+
+/// 解析 codex 限流头。无任何 x-codex-primary-* → None。
+pub fn parse_codex_headers(h: &http::HeaderMap, now_unix: i64) -> Option<CodexQuotaSnapshot> {
+    let primary_used_percent = hdr_f64(h, "x-codex-primary-used-percent")?;
+    Some(CodexQuotaSnapshot {
+        plan_type: hdr_str(h, "x-codex-plan-type").unwrap_or_default(),
+        primary_used_percent,
+        primary_window_minutes: hdr_u32(h, "x-codex-primary-window-minutes").unwrap_or(0),
+        primary_reset_after_seconds: hdr_i64(h, "x-codex-primary-reset-after-seconds").unwrap_or(0),
+        secondary_used_percent: hdr_f64(h, "x-codex-secondary-used-percent").unwrap_or(0.0),
+        secondary_window_minutes: hdr_u32(h, "x-codex-secondary-window-minutes").unwrap_or(0),
+        secondary_reset_after_seconds: hdr_i64(h, "x-codex-secondary-reset-after-seconds").unwrap_or(0),
+        captured_at: now_unix,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +200,30 @@ mod tests {
         let s = json!({"base_url":"https://x.com","apiKey":"sk-x"});
         let p = mk_provider("plain", json!({}), s);
         assert!(billing_unit(&p, "claude").is_none(), "无 usage_script 且非 codex_oauth → None");
+    }
+
+    #[test]
+    fn parse_codex_headers_real_sample() {
+        let mut h = http::HeaderMap::new();
+        h.insert("x-codex-plan-type", "prolite".parse().unwrap());
+        h.insert("x-codex-primary-used-percent", "0".parse().unwrap());
+        h.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        h.insert("x-codex-primary-reset-after-seconds", "18000".parse().unwrap());
+        h.insert("x-codex-secondary-used-percent", "2".parse().unwrap());
+        h.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        h.insert("x-codex-secondary-reset-after-seconds", "528493".parse().unwrap());
+        let s = parse_codex_headers(&h, 1_700_000_000).expect("应解析出快照");
+        assert_eq!(s.plan_type, "prolite");
+        assert_eq!(s.primary_used_percent, 0.0);
+        assert_eq!(s.primary_window_minutes, 300);
+        assert_eq!(s.secondary_used_percent, 2.0);
+        assert_eq!(s.secondary_window_minutes, 10080);
+        assert_eq!(s.captured_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn parse_codex_headers_absent_returns_none() {
+        let h = http::HeaderMap::new();
+        assert!(parse_codex_headers(&h, 0).is_none());
     }
 }
