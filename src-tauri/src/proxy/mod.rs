@@ -23,6 +23,7 @@ pub mod model_capability;
 pub mod model_mapper;
 pub mod provider_router;
 pub mod providers;
+pub mod quota;
 pub mod response_handler;
 pub mod response_processor;
 pub(crate) mod server;

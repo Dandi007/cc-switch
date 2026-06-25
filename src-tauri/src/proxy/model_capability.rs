@@ -138,10 +138,7 @@ impl CachedModelCapabilityResolver {
             {
                 return std::env::var(name).unwrap_or_else(|_| value.to_string());
             }
-            if let Some(name) = trimmed
-                .strip_prefix("${")
-                .and_then(|s| s.strip_suffix('}'))
-            {
+            if let Some(name) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
                 return std::env::var(name).unwrap_or_else(|_| value.to_string());
             }
             value.to_string()
@@ -229,7 +226,9 @@ impl ModelCapabilityResolver for CachedModelCapabilityResolver {
             }
 
             // Cache miss — fetch from network
-            let result = self.do_fetch(&base_url, api_key.as_deref(), &model_owned).await;
+            let result = self
+                .do_fetch(&base_url, api_key.as_deref(), &model_owned)
+                .await;
 
             // Update cache
             {
@@ -249,7 +248,12 @@ impl CachedModelCapabilityResolver {
     /// If `api_key` is provided, it is sent as `Authorization: Bearer <key>`.
     /// Some providers (e.g. lingzhi) require auth for `/v1/models`; without it
     /// the endpoint returns 401 and the probe fails-safe → `false`.
-    async fn do_fetch(&self, base_url: &Option<String>, api_key: Option<&str>, model: &str) -> bool {
+    async fn do_fetch(
+        &self,
+        base_url: &Option<String>,
+        api_key: Option<&str>,
+        model: &str,
+    ) -> bool {
         let base_url = match base_url {
             Some(url) => url.clone(),
             None => {
@@ -363,10 +367,22 @@ mod tests {
             in_failover_queue: false,
         };
 
-        assert!(resolver.supports_anthropic(&provider, "claude-opus-4-8").await);
-        assert!(!resolver.supports_anthropic(&provider, "deepseek-v4-pro").await);
+        assert!(
+            resolver
+                .supports_anthropic(&provider, "claude-opus-4-8")
+                .await
+        );
+        assert!(
+            !resolver
+                .supports_anthropic(&provider, "deepseek-v4-pro")
+                .await
+        );
         // Unknown model falls back to default
-        assert!(!resolver.supports_anthropic(&provider, "unknown-model").await);
+        assert!(
+            !resolver
+                .supports_anthropic(&provider, "unknown-model")
+                .await
+        );
     }
 
     #[test]

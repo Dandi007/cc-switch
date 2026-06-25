@@ -147,8 +147,7 @@ impl PayloadService {
                 Ok(PayloadDetail {
                     request_id: row.get(0)?,
                     request_body: serde_json::from_str(&request_body_str).unwrap_or(Value::Null),
-                    response_body: response_body_str
-                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    response_body: response_body_str.and_then(|s| serde_json::from_str(&s).ok()),
                     request_headers: request_headers_str
                         .and_then(|s| serde_json::from_str(&s).ok()),
                     response_headers: response_headers_str
@@ -353,11 +352,7 @@ impl PayloadService {
         Ok(count)
     }
 
-    pub fn prune(
-        state: &AppState,
-        before_timestamp: i64,
-        dry_run: bool,
-    ) -> Result<u64, AppError> {
+    pub fn prune(state: &AppState, before_timestamp: i64, dry_run: bool) -> Result<u64, AppError> {
         let conn = crate::database::lock_conn!(state.db.conn);
 
         let count: u64 = conn

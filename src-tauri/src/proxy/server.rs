@@ -10,9 +10,8 @@
 
 use super::{
     failover_switch::FailoverSwitchManager, handlers, log_codes::srv as log_srv,
-    model_capability::CachedModelCapabilityResolver,
-    provider_router::ProviderRouter, providers::gemini_shadow::GeminiShadowStore, types::*,
-    ProxyError,
+    model_capability::CachedModelCapabilityResolver, provider_router::ProviderRouter,
+    providers::gemini_shadow::GeminiShadowStore, types::*, ProxyError,
 };
 use crate::database::Database;
 use axum::{
@@ -56,6 +55,8 @@ pub struct ProxyState {
     pub failover_manager: Arc<FailoverSwitchManager>,
     /// Per-model capability resolver (cached, shared across all forwarders).
     pub model_capability: Arc<CachedModelCapabilityResolver>,
+    /// Codex 计费单元限流快照(account_id -> snapshot),被动捕获,内存态
+    pub codex_quota: crate::proxy::quota::CodexQuotaStore,
 }
 
 /// 代理HTTP服务器
@@ -91,6 +92,7 @@ impl ProxyServer {
             managed_auth,
             failover_manager,
             model_capability: Arc::new(CachedModelCapabilityResolver::new()),
+            codex_quota: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
 
         Self {
@@ -299,6 +301,7 @@ impl ProxyServer {
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))
+            .route("/quota", get(crate::proxy::quota::handle_quota))
             .route("/models", get(handlers::handle_openai_models))
             .route("/v1/models", get(handlers::handle_openai_models))
             .route("/codex/v1/models", get(handlers::handle_openai_models))

@@ -137,6 +137,8 @@ pub struct RequestForwarder {
     /// When `None` (e.g. in tests), `provider_model_supports_anthropic` returns
     /// `false` — the caller falls back to the provider-level base format.
     model_capability: Option<Arc<dyn ModelCapabilityResolver>>,
+    /// Codex OAuth 限流快照存储（按 account_id 索引）。
+    codex_quota: crate::proxy::quota::CodexQuotaStore,
 }
 
 impl RequestForwarder {
@@ -160,6 +162,7 @@ impl RequestForwarder {
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
         model_capability: Option<Arc<dyn ModelCapabilityResolver>>,
+        codex_quota: crate::proxy::quota::CodexQuotaStore,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -184,6 +187,7 @@ impl RequestForwarder {
             ),
             max_attempts,
             model_capability,
+            codex_quota,
         }
     }
 
@@ -1702,6 +1706,19 @@ impl RequestForwarder {
             // 检查响应状态
             let status = response.status();
 
+            // 被动捕获 Codex 计费单元限流快照（仅当本请求走了 codex oauth）
+            if let Some(account_id) = codex_oauth_account_id.clone() {
+                let now = chrono::Utc::now().timestamp();
+                if let Some(snap) =
+                    crate::proxy::quota::parse_codex_headers(response.headers(), now)
+                {
+                    let store = self.codex_quota.clone();
+                    tokio::spawn(async move {
+                        store.write().await.insert(account_id, snap);
+                    });
+                }
+            }
+
             if status.is_success() {
                 let response = self
                     .prepare_success_response_for_failover(response, request_is_streaming)
@@ -1819,7 +1836,10 @@ impl RequestForwarder {
             // does not need transform, so we leave it alone.
             if super::providers::claude_api_format_needs_transform(&base) {
                 if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
-                    if self.provider_model_supports_anthropic(provider, model).await {
+                    if self
+                        .provider_model_supports_anthropic(provider, model)
+                        .await
+                    {
                         return "anthropic".to_string();
                     }
                 }
@@ -1845,11 +1865,7 @@ impl RequestForwarder {
     /// Delegates to the injected `ModelCapabilityResolver`. When no resolver is
     /// configured (e.g. in tests), returns `false` — the caller falls back to the
     /// provider-level base format.
-    async fn provider_model_supports_anthropic(
-        &self,
-        provider: &Provider,
-        model: &str,
-    ) -> bool {
+    async fn provider_model_supports_anthropic(&self, provider: &Provider, model: &str) -> bool {
         match &self.model_capability {
             Some(resolver) => resolver.supports_anthropic(provider, model).await,
             None => false,
@@ -2427,6 +2443,9 @@ mod tests {
             streaming_first_byte_timeout,
             max_attempts: 1,
             model_capability: None,
+            codex_quota: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -3081,6 +3100,9 @@ mod tests {
             streaming_first_byte_timeout: Duration::from_secs(30),
             max_attempts: 1,
             model_capability: Some(resolver),
+            codex_quota: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -3120,10 +3142,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_claude_api_format_capability_unavailable_falls_back() {
         let provider = provider_with_api_format("openai_chat");
-        let forwarder = test_forwarder(
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        );
+        let forwarder = test_forwarder(Duration::from_secs(30), Duration::from_secs(30));
         // model_capability is None → provider_model_supports_anthropic returns false
         assert!(forwarder.model_capability.is_none());
 

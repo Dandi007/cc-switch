@@ -109,14 +109,14 @@ fn extract_base_url_from_provider(provider: &crate::provider::Provider) -> Optio
     }
 }
 
-/// Query provider usage (using saved script configuration)
-pub async fn query_usage(
-    state: &AppState,
+/// Query provider usage with a direct `&Database` reference (proxy-side callable).
+pub async fn query_usage_with_db(
+    db: &crate::database::Database,
     app_type: AppType,
     provider_id: &str,
 ) -> Result<UsageResult, AppError> {
     let (script_code, timeout, api_key, base_url, access_token, user_id, template_type) = {
-        let providers = state.db.get_all_providers(app_type.as_str())?;
+        let providers = db.get_all_providers(app_type.as_str())?;
         let provider = providers.get(provider_id).ok_or_else(|| {
             AppError::localized(
                 "provider.not_found",
@@ -145,19 +145,25 @@ pub async fn query_usage(
         }
 
         // Get credentials: prioritize UsageScript values, fallback to provider config
-        let api_key = usage_script
-            .api_key
-            .clone()
-            .filter(|k| !k.is_empty())
-            .or_else(|| extract_api_key_from_provider(provider))
-            .unwrap_or_default();
+        // 解析 {env:NAME} 占位符（与 proxy 转发侧一致）：usage_script 里常以
+        // `{env:LINGZHI_API_KEY}` 形式存凭据，直接透传会被上游 401。
+        let api_key = crate::proxy::quota::resolve_env_reference(
+            &usage_script
+                .api_key
+                .clone()
+                .filter(|k| !k.is_empty())
+                .or_else(|| extract_api_key_from_provider(provider))
+                .unwrap_or_default(),
+        );
 
-        let base_url = usage_script
-            .base_url
-            .clone()
-            .filter(|u| !u.is_empty())
-            .or_else(|| extract_base_url_from_provider(provider))
-            .unwrap_or_default();
+        let base_url = crate::proxy::quota::resolve_env_reference(
+            &usage_script
+                .base_url
+                .clone()
+                .filter(|u| !u.is_empty())
+                .or_else(|| extract_base_url_from_provider(provider))
+                .unwrap_or_default(),
+        );
 
         (
             usage_script.code.clone(),
@@ -180,6 +186,15 @@ pub async fn query_usage(
         template_type.as_deref(),
     )
     .await
+}
+
+/// Query provider usage (using saved script configuration)
+pub async fn query_usage(
+    state: &AppState,
+    app_type: AppType,
+    provider_id: &str,
+) -> Result<UsageResult, AppError> {
+    query_usage_with_db(&state.db, app_type, provider_id).await
 }
 
 /// Test usage script (using temporary script content, not saved)

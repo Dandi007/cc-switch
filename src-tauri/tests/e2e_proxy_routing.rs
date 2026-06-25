@@ -68,7 +68,10 @@ fn fake_codex_oauth_provider(mock_url: &str) -> Provider {
 async fn seed_providers(app: &HeadlessApp, app_type: AppType, providers: &[Provider]) {
     let app_str = app_type.as_str();
     for p in providers {
-        app.state.db.save_provider(app_str, p).expect("save provider");
+        app.state
+            .db
+            .save_provider(app_str, p)
+            .expect("save provider");
     }
     if let Some(first) = providers.first() {
         app.state
@@ -408,7 +411,10 @@ async fn r1_responses_routing_by_prefix() {
     let info = app.state.proxy_service.start().await.expect("start proxy");
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("http://{}:{}/v1/responses", info.address, info.port))
+        .post(format!(
+            "http://{}:{}/v1/responses",
+            info.address, info.port
+        ))
         .json(&json!({"model": "gpt/o1", "input": "hi"}))
         .send()
         .await
