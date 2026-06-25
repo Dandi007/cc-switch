@@ -55,8 +55,8 @@ impl PayloadLogger {
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
 
-        let payload_size = request_body_str.len()
-            + response_body_str.as_ref().map(|s| s.len()).unwrap_or(0);
+        let payload_size =
+            request_body_str.len() + response_body_str.as_ref().map(|s| s.len()).unwrap_or(0);
 
         let conn = crate::database::lock_conn!(self.db.conn);
 
@@ -183,19 +183,22 @@ fn extract_response_fields(response: &Value) -> (Option<String>, Option<String>,
                 .get("reasoning_content")
                 .and_then(|c| c.as_str())
                 .map(|s| truncate_str(s, 5000));
-            let tools = msg.get("tool_calls").and_then(|t| t.as_array()).map(|calls| {
-                let summaries: Vec<Value> = calls
-                    .iter()
-                    .filter_map(|c| {
-                        let name = c
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())?;
-                        Some(serde_json::json!({"name": name}))
-                    })
-                    .collect();
-                serde_json::to_string(&summaries).unwrap_or_default()
-            });
+            let tools = msg
+                .get("tool_calls")
+                .and_then(|t| t.as_array())
+                .map(|calls| {
+                    let summaries: Vec<Value> = calls
+                        .iter()
+                        .filter_map(|c| {
+                            let name = c
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())?;
+                            Some(serde_json::json!({"name": name}))
+                        })
+                        .collect();
+                    serde_json::to_string(&summaries).unwrap_or_default()
+                });
             return (text, tools, thinking);
         }
     }

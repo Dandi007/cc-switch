@@ -25,9 +25,7 @@ mod l2_cli_lifecycle {
             if target
                 .parse()
                 .ok()
-                .and_then(|a| {
-                    TcpStream::connect_timeout(&a, Duration::from_millis(200)).ok()
-                })
+                .and_then(|a| TcpStream::connect_timeout(&a, Duration::from_millis(200)).ok())
                 .is_some()
             {
                 return true;
@@ -116,7 +114,10 @@ mod l2_cli_lifecycle {
 
         sibling_cmd(&dir, &["--app", "codex", "proxy", "stop"]).success();
         std::thread::sleep(Duration::from_millis(500));
-        assert!(!pid_file_exists(&dir), "PID file must be removed after stop");
+        assert!(
+            !pid_file_exists(&dir),
+            "PID file must be removed after stop"
+        );
 
         let _ = proxy.kill();
     }
@@ -138,13 +139,18 @@ mod l2_cli_lifecycle {
         sibling_cmd(
             &dir,
             &[
-                "--app", "claude", "proxy", "takeover", "set", "--enabled", "true",
+                "--app",
+                "claude",
+                "proxy",
+                "takeover",
+                "set",
+                "--enabled",
+                "true",
             ],
         )
         .success();
 
-        let _stop_restore =
-            sibling_cmd(&dir, &["--app", "codex", "proxy", "stop-restore"]);
+        let _stop_restore = sibling_cmd(&dir, &["--app", "codex", "proxy", "stop-restore"]);
 
         assert!(
             wait_for_port("127.0.0.1", port, Duration::from_secs(2)),
@@ -177,7 +183,13 @@ mod l2_cli_lifecycle {
         sibling_cmd(
             &dir,
             &[
-                "--app", "claude", "proxy", "takeover", "set", "--enabled", "true",
+                "--app",
+                "claude",
+                "proxy",
+                "takeover",
+                "set",
+                "--enabled",
+                "true",
             ],
         )
         .success();
@@ -205,7 +217,13 @@ mod l2_cli_lifecycle {
         let result = sibling_cmd(
             &dir,
             &[
-                "--app", "claude", "proxy", "takeover", "set", "--enabled", "true",
+                "--app",
+                "claude",
+                "proxy",
+                "takeover",
+                "set",
+                "--enabled",
+                "true",
             ],
         );
 
@@ -234,7 +252,13 @@ mod l2_cli_lifecycle {
         sibling_cmd(
             &dir,
             &[
-                "--app", "claude", "proxy", "takeover", "set", "--enabled", "true",
+                "--app",
+                "claude",
+                "proxy",
+                "takeover",
+                "set",
+                "--enabled",
+                "true",
             ],
         )
         .success();
@@ -288,7 +312,13 @@ mod l2_cli_lifecycle {
         let result = sibling_cmd(
             &dir,
             &[
-                "--app", "claude", "proxy", "takeover", "set", "--enabled", "true",
+                "--app",
+                "claude",
+                "proxy",
+                "takeover",
+                "set",
+                "--enabled",
+                "true",
             ],
         );
 
@@ -323,10 +353,7 @@ mod l2_cli_lifecycle {
 
         // A second proxy start must be refused before init runs
         // recover_from_crash, which would tear down the active proxy.
-        let result = sibling_cmd(
-            &dir,
-            &["--app", "codex", "proxy", "start"],
-        );
+        let result = sibling_cmd(&dir, &["--app", "codex", "proxy", "start"]);
 
         let stderr = String::from_utf8_lossy(&result.get_output().stderr);
         assert!(

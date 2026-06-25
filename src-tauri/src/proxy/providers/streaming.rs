@@ -1162,12 +1162,13 @@ mod tests {
         let empty_thinking = events
             .iter()
             .filter(|e| event_type(e) == Some("content_block_delta"))
-            .filter(|e| {
-                e.pointer("/delta/type").and_then(|v| v.as_str()) == Some("thinking_delta")
-            })
+            .filter(|e| e.pointer("/delta/type").and_then(|v| v.as_str()) == Some("thinking_delta"))
             .filter(|e| e.pointer("/delta/thinking").and_then(|v| v.as_str()) == Some(""))
             .count();
-        assert_eq!(empty_thinking, 0, "empty thinking_delta must not be emitted");
+        assert_eq!(
+            empty_thinking, 0,
+            "empty thinking_delta must not be emitted"
+        );
     }
 
     #[tokio::test]

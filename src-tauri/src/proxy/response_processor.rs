@@ -667,7 +667,9 @@ pub(crate) fn create_payload_collector(
                 // 从 SSE events 中提取 upstream message_id，和 usage logger 的
                 // dedup_request_id 保持一致（格式 "session:{message_id}"）
                 let message_id = events.iter().find_map(|e| {
-                    e.get("id").and_then(|id| id.as_str()).map(|s| s.to_string())
+                    e.get("id")
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string())
                 });
                 let request_id = message_id
                     .map(|mid| format!("session:{mid}"))
@@ -975,9 +977,7 @@ pub(crate) fn aggregate_sse_events(events: &[Value]) -> Value {
                 if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                     text_parts.push(content.to_string());
                 }
-                if let Some(reasoning) =
-                    delta.get("reasoning_content").and_then(|c| c.as_str())
-                {
+                if let Some(reasoning) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                     reasoning_parts.push(reasoning.to_string());
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {

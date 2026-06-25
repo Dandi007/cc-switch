@@ -472,13 +472,12 @@ async fn handle_claude_transform(
                     let logger = UsageLogger::new(&state.db);
                     let (multiplier, pricing_model_source) =
                         logger.resolve_pricing_config(&provider_id, "claude").await;
-                    let pricing_model = if pricing_model_source
-                        == crate::database::PRICING_SOURCE_REQUEST
-                    {
-                        request_model.clone()
-                    } else {
-                        model.clone()
-                    };
+                    let pricing_model =
+                        if pricing_model_source == crate::database::PRICING_SOURCE_REQUEST {
+                            request_model.clone()
+                        } else {
+                            model.clone()
+                        };
                     if let Err(e) = logger.log_with_calculation(
                         request_id.clone(),
                         provider_id,
@@ -595,7 +594,6 @@ async fn route_provider_model_for_app(
     body["model"] = Value::String(upstream_model.to_string());
     Ok(Some(vec![provider]))
 }
-
 
 pub(crate) fn normalize_codex_oauth_responses_body(body: &mut Value) {
     const REASONING_MARKER: &str = "reasoning.encrypted_content";

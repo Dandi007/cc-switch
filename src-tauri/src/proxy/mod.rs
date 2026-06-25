@@ -3,7 +3,6 @@
 //! 提供本地HTTP代理服务，支持多Provider故障转移和请求透传
 
 pub mod body_filter;
-pub mod quota;
 pub mod cache_injector;
 pub mod circuit_breaker;
 pub mod copilot_optimizer;
@@ -24,6 +23,7 @@ pub mod model_capability;
 pub mod model_mapper;
 pub mod provider_router;
 pub mod providers;
+pub mod quota;
 pub mod response_handler;
 pub mod response_processor;
 pub(crate) mod server;

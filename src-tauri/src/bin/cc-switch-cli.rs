@@ -502,11 +502,7 @@ async fn cmd_proxy(app: &HeadlessApp, cli: &Cli, mut args: Vec<String>) -> Resul
                     // Require a running proxy before modifying takeover state.
                     // A short-lived CLI that sets takeover and exits leaves
                     // dead-pointer live configs.
-                    let running_in_process = app
-                        .state
-                        .proxy_service
-                        .is_running()
-                        .await;
+                    let running_in_process = app.state.proxy_service.is_running().await;
                     let external = external_running(cli);
 
                     if !running_in_process && external.is_none() {
@@ -913,9 +909,9 @@ async fn cmd_payload(app: &HeadlessApp, mut args: Vec<String>) -> Result<Value> 
         }
         "get" => {
             let id = required_value(&mut args, "--id")?;
-            Ok(serde_json::to_value(
-                cc_switch_lib::PayloadService::get(&app.state, &id)?,
-            )?)
+            Ok(serde_json::to_value(cc_switch_lib::PayloadService::get(
+                &app.state, &id,
+            )?)?)
         }
         "session" => {
             let id = required_value(&mut args, "--id")?;
@@ -930,13 +926,11 @@ async fn cmd_payload(app: &HeadlessApp, mut args: Vec<String>) -> Result<Value> 
             let end = take_value(&mut args, "--end")?
                 .map(|v| v.parse::<i64>())
                 .transpose()?;
-            let group_by = take_value(&mut args, "--group-by")?
-                .unwrap_or_else(|| "model".to_string());
-            Ok(serde_json::to_value(
-                cc_switch_lib::PayloadService::stats(
-                    &app.state, start, end, &group_by,
-                )?,
-            )?)
+            let group_by =
+                take_value(&mut args, "--group-by")?.unwrap_or_else(|| "model".to_string());
+            Ok(serde_json::to_value(cc_switch_lib::PayloadService::stats(
+                &app.state, start, end, &group_by,
+            )?)?)
         }
         "export" => {
             let output = required_value(&mut args, "--output")?;
@@ -946,17 +940,14 @@ async fn cmd_payload(app: &HeadlessApp, mut args: Vec<String>) -> Result<Value> 
             let end = take_value(&mut args, "--end")?
                 .map(|v| v.parse::<i64>())
                 .transpose()?;
-            let count =
-                cc_switch_lib::PayloadService::export(&app.state, start, end, &output)?;
+            let count = cc_switch_lib::PayloadService::export(&app.state, start, end, &output)?;
             Ok(serde_json::json!({ "exported": count, "path": output }))
         }
         "prune" => {
             let before = required_value(&mut args, "--before")?;
             let before_ts: i64 = before.parse()?;
             let dry_run = take_bool(&mut args, "--dry-run");
-            let count = cc_switch_lib::PayloadService::prune(
-                &app.state, before_ts, dry_run,
-            )?;
+            let count = cc_switch_lib::PayloadService::prune(&app.state, before_ts, dry_run)?;
             Ok(serde_json::json!({
                 "would_delete": count,
                 "dry_run": dry_run,
@@ -977,8 +968,8 @@ async fn run() -> Result<()> {
     // must not trigger recover_from_crash, which would tear down an already
     // running proxy.
     let first_arg = cli.args.first().map(|s| s.as_str()).unwrap_or("");
-    let is_proxy_start = first_arg == "proxy"
-        && cli.args.get(1).map(|s| s.as_str()) == Some("start");
+    let is_proxy_start =
+        first_arg == "proxy" && cli.args.get(1).map(|s| s.as_str()) == Some("start");
 
     // HeadlessApp::init(recover_proxy=true) runs recover_from_crash, which
     // mutates live config & deletes backup files. If another proxy process
@@ -1019,7 +1010,9 @@ async fn run() -> Result<()> {
 
 #[tokio::main]
 async fn main() {
-    let is_proxy_start = std::env::args().collect::<Vec<_>>().windows(2)
+    let is_proxy_start = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
         .any(|w| w[0] == "proxy" && w[1] == "start");
     let default_level = if is_proxy_start { "info" } else { "warn" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))

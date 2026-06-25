@@ -10,9 +10,8 @@
 
 use super::{
     failover_switch::FailoverSwitchManager, handlers, log_codes::srv as log_srv,
-    model_capability::CachedModelCapabilityResolver,
-    provider_router::ProviderRouter, providers::gemini_shadow::GeminiShadowStore, types::*,
-    ProxyError,
+    model_capability::CachedModelCapabilityResolver, provider_router::ProviderRouter,
+    providers::gemini_shadow::GeminiShadowStore, types::*, ProxyError,
 };
 use crate::database::Database;
 use axum::{
