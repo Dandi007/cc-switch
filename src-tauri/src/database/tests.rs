@@ -346,6 +346,129 @@ fn schema_migration_v4_adds_pricing_model_columns() {
 }
 
 #[test]
+fn schema_migration_v10_to_v11_drops_provider_health_fk() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+
+    // 模拟 v10：provider_health 带指向 providers 的外键，且已有数据
+    Database::set_user_version(&conn, 10).expect("set user_version=10");
+    // 种子数据时临时关闭外键，避免 providers 为空导致插入失败
+    conn.execute("PRAGMA foreign_keys = OFF;", [])
+        .expect("disable foreign keys for seeding");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE providers (
+            id TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            settings_config TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (id, app_type)
+        );
+        CREATE TABLE provider_health (
+            provider_id TEXT NOT NULL, app_type TEXT NOT NULL, is_healthy INTEGER NOT NULL DEFAULT 1,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_failure_at TEXT,
+            last_error TEXT, updated_at TEXT NOT NULL,
+            PRIMARY KEY (provider_id, app_type),
+            FOREIGN KEY (provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+        );
+        INSERT INTO provider_health (provider_id, app_type, is_healthy, consecutive_failures, updated_at)
+        VALUES ('lingzhi', 'codex', 1, 0, '2026-07-28T00:00:00Z');
+        INSERT INTO provider_health (provider_id, app_type, is_healthy, consecutive_failures, updated_at)
+        VALUES ('gpt', 'codex', 0, 3, '2026-07-28T01:00:00Z');
+        "#,
+    )
+    .expect("seed v10 schema with FK");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    // 1. 外键已消失
+    let fk_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('provider_health')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count fk");
+    assert_eq!(fk_count, 0, "provider_health 迁移后应无外键");
+
+    // 2. 行数与内容保持不变
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM provider_health", [], |r| r.get(0))
+        .expect("count rows");
+    assert_eq!(count, 2, "provider_health 行数应保持不变");
+
+    let (pid, app, healthy, failures): (String, String, i64, i64) = conn
+        .query_row(
+            "SELECT provider_id, app_type, is_healthy, consecutive_failures
+             FROM provider_health WHERE provider_id='gpt'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("read gpt row");
+    assert_eq!(
+        (pid.as_str(), app.as_str(), healthy, failures),
+        ("gpt", "codex", 0, 3),
+        "provider_health 内容应保持不变"
+    );
+
+    // 3. 写入 providers 中不存在的 (provider_id, app_type) 组合应成功（FK 已移除）
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+    conn.execute(
+        "INSERT INTO provider_health (provider_id, app_type, is_healthy, consecutive_failures, updated_at)
+         VALUES ('lingzhi', 'claude', 1, 0, '2026-07-28T02:00:00Z')",
+        [],
+    )
+    .expect("写入 providers 中不存在的 (provider_id, app_type) 组合应成功");
+
+    // 4. 幂等性：连续再次执行迁移不报错、不丢数据
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations again");
+    let count_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM provider_health", [], |r| r.get(0))
+        .expect("count rows after second migration");
+    assert_eq!(count_after, 3, "再次迁移不应丢失数据");
+    let fk_count_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('provider_health')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count fk after second migration");
+    assert_eq!(fk_count_after, 0, "再次迁移后仍应无外键");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        SCHEMA_VERSION
+    );
+}
+
+#[test]
+fn schema_migration_v11_fresh_db_has_no_provider_health_fk() {
+    // 全新库：create_tables 直接创建无外键的 provider_health
+    let conn = Connection::open_in_memory().expect("open memory db");
+    Database::create_tables_on_conn(&conn).expect("create tables");
+
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+
+    // 写入 providers 中不存在的组合，全新库应直接成功（无外键）
+    conn.execute(
+        "INSERT INTO provider_health (provider_id, app_type, is_healthy, consecutive_failures, updated_at)
+         VALUES ('lingzhi', 'claude', 1, 0, '2026-07-28T02:00:00Z')",
+        [],
+    )
+    .expect("全新库写入 providers 中不存在的 (provider_id, app_type) 组合应成功");
+
+    let fk_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('provider_health')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count fk");
+    assert_eq!(fk_count, 0, "全新库 provider_health 应无外键");
+}
+
+#[test]
 fn schema_create_tables_repairs_legacy_proxy_config_singleton_to_per_app() {
     let conn = Connection::open_in_memory().expect("open memory db");
 
