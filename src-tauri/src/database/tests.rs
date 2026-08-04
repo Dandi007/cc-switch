@@ -690,3 +690,109 @@ fn ensure_incremental_auto_vacuum_rebuilds_existing_file_db() {
         "file db should persist INCREMENTAL auto_vacuum after VACUUM rebuild"
     );
 }
+
+/// 构造 v10 结构：providers 表 + 带外键的 provider_health 表。
+fn seed_v10_provider_health_schema(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE providers (
+            id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL,
+            settings_config TEXT NOT NULL, PRIMARY KEY (id, app_type)
+        );
+        CREATE TABLE provider_health (
+            provider_id TEXT NOT NULL, app_type TEXT NOT NULL, is_healthy INTEGER NOT NULL DEFAULT 1,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_failure_at TEXT,
+            last_error TEXT, updated_at TEXT NOT NULL,
+            PRIMARY KEY (provider_id, app_type),
+            FOREIGN KEY (provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+        );
+        INSERT INTO providers (id, app_type, name, settings_config) VALUES
+            ('lingzhi', 'codex', 'Lingzhi', '{}'),
+            ('gpt', 'codex', 'GPT', '{}');
+        INSERT INTO provider_health
+            (provider_id, app_type, is_healthy, consecutive_failures, updated_at) VALUES
+            ('lingzhi', 'codex', 1, 0, '2026-07-28T00:00:00Z'),
+            ('gpt', 'codex', 0, 3, '2026-07-28T01:00:00Z');",
+    )
+    .expect("seed v10 provider_health schema");
+}
+
+#[test]
+fn migrate_v10_to_v11_removes_provider_health_fk_preserving_rows() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    seed_v10_provider_health_schema(&conn);
+    Database::set_user_version(&conn, 10).expect("set user_version=10");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        SCHEMA_VERSION
+    );
+
+    // 外键已消失
+    let fk_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('provider_health')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count fk");
+    assert_eq!(fk_count, 0, "provider_health should have no foreign keys after migration");
+
+    // 数据保留且内容不变
+    let rows: Vec<(String, String, i64, i64)> = conn
+        .prepare(
+            "SELECT provider_id, app_type, is_healthy, consecutive_failures
+             FROM provider_health ORDER BY provider_id",
+        )
+        .expect("prepare")
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("map")
+        .collect::<Result<_, _>>()
+        .expect("collect");
+    assert_eq!(
+        rows,
+        vec![
+            ("gpt".to_string(), "codex".to_string(), 0, 3),
+            ("lingzhi".to_string(), "codex".to_string(), 1, 0),
+        ]
+    );
+
+    // 幂等：再执行一次不报错、不丢数据
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations again");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM provider_health", [], |row| row.get(0))
+        .expect("count rows");
+    assert_eq!(count, 2, "second migration must not lose data");
+}
+
+#[test]
+fn migrate_v10_to_v11_allows_health_write_for_unknown_provider() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON", [])
+        .expect("enable foreign keys");
+    seed_v10_provider_health_schema(&conn);
+    Database::set_user_version(&conn, 10).expect("set user_version=10");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    // (lingzhi, claude) 在 providers 中不存在，但去掉外键后应能写入成功
+    conn.execute(
+        "INSERT OR REPLACE INTO provider_health
+         (provider_id, app_type, is_healthy, consecutive_failures, updated_at)
+         VALUES (?1, ?2, 1, 0, '2026-07-28T02:00:00Z')",
+        params!["lingzhi", "claude"],
+    )
+    .expect("writing health for a provider not in providers should succeed");
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM provider_health WHERE provider_id = 'lingzhi' AND app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count row");
+    assert_eq!(count, 1, "health row for unknown provider should be persisted");
+}

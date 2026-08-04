@@ -176,8 +176,7 @@ impl Database {
             provider_id TEXT NOT NULL, app_type TEXT NOT NULL, is_healthy INTEGER NOT NULL DEFAULT 1,
             consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_failure_at TEXT,
             last_error TEXT, updated_at TEXT NOT NULL,
-            PRIMARY KEY (provider_id, app_type),
-            FOREIGN KEY (provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+            PRIMARY KEY (provider_id, app_type)
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         // 10. Proxy Request Logs 表
@@ -430,6 +429,11 @@ impl Database {
                         log::info!("迁移数据库从 v9 到 v10（添加 Hermes Agent 支持）");
                         Self::migrate_v9_to_v10(conn)?;
                         Self::set_user_version(conn, 10)?;
+                    }
+                    10 => {
+                        log::info!("迁移数据库从 v10 到 v11（移除 provider_health 的 providers 外键）");
+                        Self::migrate_v10_to_v11(conn)?;
+                        Self::set_user_version(conn, 11)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1197,6 +1201,74 @@ impl Database {
         }
 
         log::info!("v9 -> v10 迁移完成：已添加 Hermes Agent 支持");
+        Ok(())
+    }
+
+    /// v10 -> v11 迁移：移除 provider_health 指向 providers 的外键。
+    ///
+    /// 健康度是对「观测到的上游」的观测记录，其生命周期不应从属于配置路由条目
+    /// （providers 只存配置的路由，解析出的上游可能没有对应 (id, app_type) 行，
+    /// 导致 FK 永不满足、健康度写入失败）。SQLite 无法直接 DROP CONSTRAINT，
+    /// 采用表重建方式实现，且幂等（重复执行不报错、不丢数据）。
+    fn migrate_v10_to_v11(conn: &Connection) -> Result<(), AppError> {
+        Self::rebuild_provider_health_without_fk(conn)?;
+        log::info!("v10 -> v11 迁移完成：已移除 provider_health 的 providers 外键");
+        Ok(())
+    }
+
+    /// 重建 provider_health 表，去掉指向 providers 的外键约束。
+    ///
+    /// 幂等：若表已不存在则直接创建；若已无外键则跳过重建。数据原样保留。
+    fn rebuild_provider_health_without_fk(conn: &Connection) -> Result<(), AppError> {
+        const PROVIDER_HEALTH_SCHEMA: &str = "
+            provider_id TEXT NOT NULL, app_type TEXT NOT NULL, is_healthy INTEGER NOT NULL DEFAULT 1,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_failure_at TEXT,
+            last_error TEXT, updated_at TEXT NOT NULL,
+            PRIMARY KEY (provider_id, app_type)";
+
+        if !Self::table_exists(conn, "provider_health")? {
+            conn.execute(
+                &format!("CREATE TABLE provider_health ({PROVIDER_HEALTH_SCHEMA})"),
+                [],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            return Ok(());
+        }
+
+        // 已无外键则无需重建，保证幂等。
+        let fk_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('provider_health')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if fk_count == 0 {
+            return Ok(());
+        }
+
+        conn.execute("DROP TABLE IF EXISTS provider_health_new", [])
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute(
+            &format!("CREATE TABLE provider_health_new ({PROVIDER_HEALTH_SCHEMA})"),
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO provider_health_new (
+                provider_id, app_type, is_healthy, consecutive_failures,
+                last_success_at, last_failure_at, last_error, updated_at
+             )
+             SELECT provider_id, app_type, is_healthy, consecutive_failures,
+                    last_success_at, last_failure_at, last_error, updated_at
+             FROM provider_health",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute("DROP TABLE provider_health", [])
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        conn.execute("ALTER TABLE provider_health_new RENAME TO provider_health", [])
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
 
