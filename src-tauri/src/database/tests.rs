@@ -883,8 +883,13 @@ fn migrate_v11_to_v12_disables_lingzhi_usage_script_only() {
     let v: serde_json::Value = serde_json::from_str(&meta).expect("parse meta");
     assert_eq!(v["usage_script"]["enabled"].as_bool(), Some(true));
 
-    // 幂等：再次执行不报错、结果一致
+    // 幂等：重置到 v11 后重新执行迁移体，确保迁移本身可重复运行且结果一致
+    Database::set_user_version(&conn, 11).expect("reset user_version to 11");
     Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations again");
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after second migration"),
+        SCHEMA_VERSION
+    );
     let meta: String = conn
         .query_row(
             "SELECT meta FROM providers WHERE id = 'lingzhi' AND app_type = 'codex'",

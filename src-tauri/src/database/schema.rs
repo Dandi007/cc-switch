@@ -1283,6 +1283,8 @@ impl Database {
     ///
     /// 在 provider 配置侧把 lingzhi 的 `meta.usage_script.enabled` 置为 `false`，
     /// 使 `has_usage_script_enabled()` 返回 false，从而不再产出计费单元。
+    /// lingzhi 额度查询已改由 quota-api 提供（`http://127.0.0.1:8101/api/quotas`），
+    /// 本迁移不再由 cc-switch 产出灵智计费单元。
     /// 幂等：对已禁用或无 usage_script 的行不会重复改动。
     fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
         // providers 表可能因旧版测试/迁移场景缺少 meta 列，直接跳过（幂等）。
@@ -1292,7 +1294,7 @@ impl Database {
         }
 
         let mut stmt = conn
-            .prepare("SELECT id, app_type, meta FROM providers")
+            .prepare("SELECT id, name, app_type, meta FROM providers")
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let rows = stmt
@@ -1301,16 +1303,31 @@ impl Database {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         let mut updates = Vec::new();
         for row in rows {
-            let (id, app_type, meta_str) = row.map_err(|e| AppError::Database(e.to_string()))?;
+            let (id, name, app_type, meta_str) =
+                row.map_err(|e| AppError::Database(e.to_string()))?;
 
-            // 仅处理 lingzhi 供应商
-            if !id.eq_ignore_ascii_case("lingzhi") {
+            // 识别 lingzhi 供应商：id 或 name 命中 lingzhi/灵智/zhiyuan，
+            // 或 usage_script 内容含特征标记（如 planName 'zhiyuan'）。
+            // 除字面 slug 'lingzhi' 外，也覆盖通过 UI 添加时的 UUID id 情况。
+            let id_lower = id.to_lowercase();
+            let name_lower = name.to_lowercase();
+            let meta_lower = meta_str.to_lowercase();
+            let is_lingzhi = id_lower == "lingzhi"
+                || name_lower == "lingzhi"
+                || name_lower.contains("lingzhi")
+                || name_lower.contains("zhiyuan")
+                || name.contains("灵智")
+                || meta_lower.contains("zhiyuan")
+                || meta_str.contains("灵智");
+
+            if !is_lingzhi {
                 continue;
             }
 
@@ -1337,7 +1354,7 @@ impl Database {
             }
         }
 
-        for (id, app_type, new_meta) in updates {
+        for (id, app_type, new_meta) in &updates {
             conn.execute(
                 "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
                 params![new_meta, id, app_type],
@@ -1345,7 +1362,14 @@ impl Database {
             .map_err(|e| AppError::Database(e.to_string()))?;
         }
 
-        log::info!("v11 -> v12 迁移完成：已禁用 lingzhi 的 usage_script（退役 lingzhi 计费单元）");
+        if updates.is_empty() {
+            log::info!("v11 -> v12 迁移：未发现需要禁用的 lingzhi usage_script 行（可能已禁用或不存在）");
+        } else {
+            log::info!(
+                "v11 -> v12 迁移完成：已禁用 {} 行 lingzhi 的 usage_script（退役 lingzhi 计费单元）",
+                updates.len()
+            );
+        }
         Ok(())
     }
 
