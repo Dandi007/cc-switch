@@ -796,3 +796,107 @@ fn migrate_v10_to_v11_allows_health_write_for_unknown_provider() {
         .expect("count row");
     assert_eq!(count, 1, "health row for unknown provider should be persisted");
 }
+
+#[test]
+fn migrate_v11_to_v12_disables_lingzhi_usage_script() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+
+    // 建完整 schema，再插入 lingzhi（含 usage_script）与一个对照 provider（codex OAuth）。
+    Database::create_tables_on_conn(&conn).expect("create tables");
+
+    let lingzhi_meta = json!({
+        "usage_script": {
+            "enabled": true,
+            "language": "javascript",
+            "code": "({ request: { method:'GET', url:'{{baseUrl}}/api/user/self' }, extractor: function(d){ return { isValid:true, remaining:0, used:0, total:0, unit:'USD', planName:'zhiyuan' }; } })"
+        }
+    });
+    let codex_oauth_meta = json!({
+        "provider_type": "codex_oauth",
+        "usage_script": {
+            "enabled": true,
+            "language": "javascript",
+            "code": "x"
+        }
+    });
+
+    conn.execute(
+        "INSERT INTO providers (id, app_type, name, settings_config, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            "lingzhi",
+            "claude",
+            "Lingzhi",
+            serde_json::to_string(&json!({ "anthropicApiKey": "sk-test" })).unwrap(),
+            serde_json::to_string(&lingzhi_meta).unwrap(),
+        ],
+    )
+    .expect("seed lingzhi provider");
+    conn.execute(
+        "INSERT INTO providers (id, app_type, name, settings_config, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            "my-codex",
+            "claude",
+            "Codex OAuth",
+            serde_json::to_string(&json!({ "anthropicApiKey": "sk-test" })).unwrap(),
+            serde_json::to_string(&codex_oauth_meta).unwrap(),
+        ],
+    )
+    .expect("seed codex oauth provider");
+
+    Database::set_user_version(&conn, 11).expect("set user_version=11");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        SCHEMA_VERSION
+    );
+
+    // lingzhi 的 usage_script.enabled 必须被置为 false
+    let lingzhi_meta_after: String = conn
+        .query_row(
+            "SELECT meta FROM providers WHERE id = 'lingzhi' AND app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read lingzhi meta");
+    let lingzhi_meta_after: serde_json::Value =
+        serde_json::from_str(&lingzhi_meta_after).expect("parse lingzhi meta");
+    assert_eq!(
+        lingzhi_meta_after["usage_script"]["enabled"],
+        false,
+        "lingzhi usage_script should be disabled after migration"
+    );
+
+    // 对照 provider（codex OAuth）的 usage_script 必须保持不变
+    let codex_meta_after: String = conn
+        .query_row(
+            "SELECT meta FROM providers WHERE id = 'my-codex' AND app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read codex meta");
+    let codex_meta_after: serde_json::Value =
+        serde_json::from_str(&codex_meta_after).expect("parse codex meta");
+    assert_eq!(
+        codex_meta_after["usage_script"]["enabled"],
+        true,
+        "codex oauth usage_script should be unchanged"
+    );
+
+    // 幂等：连续执行两次不报错、结果一致（JSON 语义一致）
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations again");
+    let lingzhi_meta_twice: String = conn
+        .query_row(
+            "SELECT meta FROM providers WHERE id = 'lingzhi' AND app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read lingzhi meta again");
+    let lingzhi_meta_twice: serde_json::Value =
+        serde_json::from_str(&lingzhi_meta_twice).expect("parse lingzhi meta again");
+    assert_eq!(
+        lingzhi_meta_twice, lingzhi_meta_after,
+        "second migration must not change lingzhi meta"
+    );
+}
