@@ -172,12 +172,12 @@ impl Database {
         }
 
         // 9. Provider Health 表
+        // 健康度是对上游的观测记录，生命周期不应从属于配置条目，因此不设指向 providers 的外键。
         conn.execute("CREATE TABLE IF NOT EXISTS provider_health (
             provider_id TEXT NOT NULL, app_type TEXT NOT NULL, is_healthy INTEGER NOT NULL DEFAULT 1,
             consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_failure_at TEXT,
             last_error TEXT, updated_at TEXT NOT NULL,
-            PRIMARY KEY (provider_id, app_type),
-            FOREIGN KEY (provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+            PRIMARY KEY (provider_id, app_type)
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         // 10. Proxy Request Logs 表
@@ -430,6 +430,11 @@ impl Database {
                         log::info!("迁移数据库从 v9 到 v10（添加 Hermes Agent 支持）");
                         Self::migrate_v9_to_v10(conn)?;
                         Self::set_user_version(conn, 10)?;
+                    }
+                    10 => {
+                        log::info!("迁移数据库从 v10 到 v11（移除 provider_health 外键约束）");
+                        Self::migrate_v10_to_v11(conn)?;
+                        Self::set_user_version(conn, 11)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1197,6 +1202,49 @@ impl Database {
         }
 
         log::info!("v9 -> v10 迁移完成：已添加 Hermes Agent 支持");
+        Ok(())
+    }
+
+    /// v10 -> v11 迁移：移除 provider_health 指向 providers 的外键约束
+    ///
+    /// 健康度是对上游的观测记录，其生命周期不应从属于配置条目。
+    /// 解析出的上游（如 lingzhi）在 `providers` 中可能没有对应 `(id, app_type)` 行，
+    /// 原 FK 会导致健康度写入失败。
+    ///
+    /// SQLite 无法直接 DROP CONSTRAINT，需走表重建：
+    /// `provider_health_new` → 复制数据 → 删旧表 → 重命名。
+    /// 幂等：重复执行不报错、不丢数据。
+    pub(crate) fn migrate_v10_to_v11(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "provider_health")? {
+            conn.execute("DROP TABLE IF EXISTS provider_health_new", [])
+                .map_err(|e| AppError::Database(format!("删除 provider_health_new 失败: {e}")))?;
+            conn.execute(
+                "CREATE TABLE provider_health_new (
+                    provider_id TEXT NOT NULL, app_type TEXT NOT NULL, is_healthy INTEGER NOT NULL DEFAULT 1,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_failure_at TEXT,
+                    last_error TEXT, updated_at TEXT NOT NULL,
+                    PRIMARY KEY (provider_id, app_type)
+                )",
+                [],
+            )
+            .map_err(|e| AppError::Database(format!("创建 provider_health_new 失败: {e}")))?;
+            conn.execute(
+                "INSERT INTO provider_health_new (
+                    provider_id, app_type, is_healthy, consecutive_failures,
+                    last_success_at, last_failure_at, last_error, updated_at
+                ) SELECT provider_id, app_type, is_healthy, consecutive_failures,
+                    last_success_at, last_failure_at, last_error, updated_at
+                FROM provider_health",
+                [],
+            )
+            .map_err(|e| AppError::Database(format!("迁移 provider_health 数据失败: {e}")))?;
+            conn.execute("DROP TABLE provider_health", [])
+                .map_err(|e| AppError::Database(format!("删除旧 provider_health 表失败: {e}")))?;
+            conn.execute("ALTER TABLE provider_health_new RENAME TO provider_health", [])
+                .map_err(|e| AppError::Database(format!("重命名 provider_health 表失败: {e}")))?;
+        }
+
+        log::info!("v10 -> v11 迁移完成：已移除 provider_health 外键约束");
         Ok(())
     }
 

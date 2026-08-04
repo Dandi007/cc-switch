@@ -690,3 +690,147 @@ fn ensure_incremental_auto_vacuum_rebuilds_existing_file_db() {
         "file db should persist INCREMENTAL auto_vacuum after VACUUM rebuild"
     );
 }
+
+/// 构造 v10 结构（provider_health 带指向 providers 的外键）并插入两行数据。
+fn seed_v10_provider_health(conn: &Connection) {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE providers (
+            id TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            settings_config TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (id, app_type)
+        );
+        CREATE TABLE provider_health (
+            provider_id TEXT NOT NULL, app_type TEXT NOT NULL, is_healthy INTEGER NOT NULL DEFAULT 1,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0, last_success_at TEXT, last_failure_at TEXT,
+            last_error TEXT, updated_at TEXT NOT NULL,
+            PRIMARY KEY (provider_id, app_type),
+            FOREIGN KEY (provider_id, app_type) REFERENCES providers(id, app_type) ON DELETE CASCADE
+        );
+        INSERT INTO providers (id, app_type, name) VALUES ('lingzhi', 'codex', 'Lingzhi');
+        INSERT INTO providers (id, app_type, name) VALUES ('gpt', 'codex', 'GPT');
+        INSERT INTO provider_health VALUES ('lingzhi', 'codex', 1, 0, NULL, NULL, NULL, '2026-01-01T00:00:00Z');
+        INSERT INTO provider_health VALUES ('gpt', 'codex', 0, 2, NULL, NULL, 'some error', '2026-01-01T00:00:00Z');
+        "#,
+    )
+    .expect("seed v10 provider_health schema");
+}
+
+#[test]
+fn migration_v10_to_v11_removes_provider_health_fk_preserves_rows() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+
+    seed_v10_provider_health(&conn);
+    Database::set_user_version(&conn, 10).expect("set user_version=10");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        SCHEMA_VERSION
+    );
+
+    // 外键已消失
+    let fk_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('provider_health')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count foreign keys");
+    assert_eq!(fk_count, 0, "provider_health 不应再有指向 providers 的外键");
+
+    // 行数与内容保持不变
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM provider_health", [], |r| r.get(0))
+        .expect("count rows");
+    assert_eq!(count, 2, "provider_health 行数应保持不变");
+
+    let lingzhi: String = conn
+        .query_row(
+            "SELECT app_type FROM provider_health WHERE provider_id = 'lingzhi'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read lingzhi row");
+    assert_eq!(lingzhi, "codex");
+
+    let gpt_error: String = conn
+        .query_row(
+            "SELECT last_error FROM provider_health WHERE provider_id = 'gpt'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read gpt row");
+    assert_eq!(gpt_error, "some error");
+}
+
+#[test]
+fn migration_v10_to_v11_is_idempotent() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+
+    seed_v10_provider_health(&conn);
+
+    // 直接执行两次迁移函数，验证幂等（不报错、不丢数据）
+    Database::migrate_v10_to_v11(&conn).expect("first migration run");
+    Database::migrate_v10_to_v11(&conn).expect("second migration run");
+
+    let fk_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('provider_health')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count foreign keys");
+    assert_eq!(fk_count, 0, "provider_health 不应再有外键");
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM provider_health", [], |r| r.get(0))
+        .expect("count rows");
+    assert_eq!(count, 2, "重复执行后行数应保持不变");
+}
+
+#[test]
+fn provider_health_accepts_unknown_provider_after_migration() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+
+    seed_v10_provider_health(&conn);
+    Database::set_user_version(&conn, 10).expect("set user_version=10");
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    // 写入一个在 providers 中不存在的 (provider_id, app_type) 组合（如 lingzhi/claude）
+    conn.execute(
+        "INSERT INTO provider_health (
+            provider_id, app_type, is_healthy, consecutive_failures,
+            last_success_at, last_failure_at, last_error, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "lingzhi",
+            "claude",
+            1,
+            0,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "2026-01-01T00:00:00Z",
+        ],
+    )
+    .expect("insert unknown provider health should succeed without FK");
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM provider_health WHERE provider_id = 'lingzhi' AND app_type = 'claude'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(count, 1, "不应再有外键约束导致写入失败");
+}
