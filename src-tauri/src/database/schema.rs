@@ -435,6 +435,13 @@ impl Database {
                         Self::migrate_v10_to_v11(conn)?;
                         Self::set_user_version(conn, 11)?;
                     }
+                    11 => {
+                        log::info!(
+                            "迁移数据库从 v11 到 v12（退役 lingzhi 计费单元：禁用 usage_script）"
+                        );
+                        Self::migrate_v11_to_v12(conn)?;
+                        Self::set_user_version(conn, 12)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1269,6 +1276,76 @@ impl Database {
             .map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("ALTER TABLE provider_health_new RENAME TO provider_health", [])
             .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// v11 -> v12: 退役 lingzhi 计费单元。
+    ///
+    /// 在 provider 配置侧把 lingzhi 的 `meta.usage_script.enabled` 置为 `false`，
+    /// 使 `has_usage_script_enabled()` 返回 false，从而不再产出计费单元。
+    /// 幂等：对已禁用或无 usage_script 的行不会重复改动。
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+        // providers 表可能因旧版测试/迁移场景缺少 meta 列，直接跳过（幂等）。
+        if !Self::has_column(conn, "providers", "meta")? {
+            log::info!("v11 -> v12 迁移跳过：providers 表无 meta 列");
+            return Ok(());
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT id, app_type, meta FROM providers")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, app_type, meta_str) = row.map_err(|e| AppError::Database(e.to_string()))?;
+
+            // 仅处理 lingzhi 供应商
+            if !id.eq_ignore_ascii_case("lingzhi") {
+                continue;
+            }
+
+            if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                let mut updated = false;
+                if let Some(usage_script) = meta.get_mut("usage_script") {
+                    let enabled = usage_script
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if enabled {
+                        if let Some(obj) = usage_script.as_object_mut() {
+                            obj.insert("enabled".to_string(), serde_json::Value::Bool(false));
+                            updated = true;
+                        }
+                    }
+                }
+
+                if updated {
+                    let new_meta_str = serde_json::to_string(&meta)
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    updates.push((id, app_type, new_meta_str));
+                }
+            }
+        }
+
+        for (id, app_type, new_meta) in updates {
+            conn.execute(
+                "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
+                params![new_meta, id, app_type],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
+        log::info!("v11 -> v12 迁移完成：已禁用 lingzhi 的 usage_script（退役 lingzhi 计费单元）");
         Ok(())
     }
 

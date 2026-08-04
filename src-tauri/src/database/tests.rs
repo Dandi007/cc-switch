@@ -796,3 +796,106 @@ fn migrate_v10_to_v11_allows_health_write_for_unknown_provider() {
         .expect("count row");
     assert_eq!(count, 1, "health row for unknown provider should be persisted");
 }
+
+fn seed_v11_schema(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE providers (
+            id TEXT NOT NULL,
+            app_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            settings_config TEXT NOT NULL DEFAULT '{}',
+            meta TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (id, app_type)
+        );
+        INSERT INTO providers (id, app_type, name, settings_config, meta) VALUES
+            ('lingzhi', 'codex', 'Lingzhi', '{}',
+             '{\"usage_script\":{\"enabled\":true,\"code\":\"({request:{method:''GET'',url:''{{baseUrl}}/api/user/self''}})\"}}'),
+            ('lingzhi', 'claude', 'Lingzhi', '{}',
+             '{\"usage_script\":{\"enabled\":true,\"code\":\"x\"}}'),
+            ('codex_oauth', 'claude', 'Codex OAuth', '{}',
+             '{\"provider_type\":\"codex_oauth\",\"usage_script\":{\"enabled\":true,\"code\":\"x\"}}'),
+            ('gpt', 'codex', 'GPT', '{}', '{\"usage_script\":{\"enabled\":true}}');",
+    )
+    .expect("seed v11 schema");
+}
+
+#[test]
+fn migrate_v11_to_v12_disables_lingzhi_usage_script_only() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    seed_v11_schema(&conn);
+    Database::set_user_version(&conn, 11).expect("set user_version=11");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        SCHEMA_VERSION
+    );
+
+    let meta: String = conn
+        .query_row(
+            "SELECT meta FROM providers WHERE id = 'lingzhi' AND app_type = 'codex'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("lingzhi codex meta");
+    let v: serde_json::Value = serde_json::from_str(&meta).expect("parse meta");
+    assert_eq!(
+        v["usage_script"]["enabled"].as_bool(),
+        Some(false),
+        "lingzhi usage_script should be disabled after migration"
+    );
+
+    // 其他 lingzhi 行也应被禁用
+    let meta: String = conn
+        .query_row(
+            "SELECT meta FROM providers WHERE id = 'lingzhi' AND app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("lingzhi claude meta");
+    let v: serde_json::Value = serde_json::from_str(&meta).expect("parse meta");
+    assert_eq!(v["usage_script"]["enabled"].as_bool(), Some(false));
+
+    // codex OAuth 计费单元不受影响
+    let meta: String = conn
+        .query_row(
+            "SELECT meta FROM providers WHERE id = 'codex_oauth' AND app_type = 'claude'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("codex oauth meta");
+    let v: serde_json::Value = serde_json::from_str(&meta).expect("parse meta");
+    assert_eq!(
+        v["usage_script"]["enabled"].as_bool(),
+        Some(true),
+        "codex OAuth usage_script must remain enabled"
+    );
+
+    // 非 lingzhi 行不受影响
+    let meta: String = conn
+        .query_row(
+            "SELECT meta FROM providers WHERE id = 'gpt' AND app_type = 'codex'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("gpt meta");
+    let v: serde_json::Value = serde_json::from_str(&meta).expect("parse meta");
+    assert_eq!(v["usage_script"]["enabled"].as_bool(), Some(true));
+
+    // 幂等：再次执行不报错、结果一致
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations again");
+    let meta: String = conn
+        .query_row(
+            "SELECT meta FROM providers WHERE id = 'lingzhi' AND app_type = 'codex'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("lingzhi codex meta after second run");
+    let v: serde_json::Value = serde_json::from_str(&meta).expect("parse meta");
+    assert_eq!(
+        v["usage_script"]["enabled"].as_bool(),
+        Some(false),
+        "second migration must not re-enable usage_script"
+    );
+}
